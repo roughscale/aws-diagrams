@@ -1,0 +1,178 @@
+aws_topology:
+  metadata:
+    generated_at: "2024-01-01T12:00:00"
+    generator_version: "0.1.0"
+    last_updated: "2024-01-01T12:00:00"
+    total_accounts: 1
+    total_regions: 1
+    total_resources: 8
+    collection_duration_seconds: 45.2
+    api_calls_made: 12
+    errors: []
+
+  organization:
+    organization_id: "o-1234567890"
+    management_account_id: "123456789012"
+    accounts:
+      "123456789012":
+        account_id: "123456789012"
+        account_name: "production"
+        last_updated: "2024-01-01T12:00:00"
+        regions:
+          "us-east-1":
+            region: "us-east-1"
+            last_updated: "2024-01-01T12:00:00"
+            resources:
+              vpc:
+                "vpc-abc123":
+                  resource_id: "vpc-abc123"
+                  resource_type: "vpc"
+                  name: "main-vpc"
+                  arn: "arn:aws:ec2:us-east-1:123456789012:vpc/vpc-abc123"
+                  location:
+                    account_id: "123456789012"
+                    region: "us-east-1"
+                    availability_zone: null
+                  metadata:
+                    discovered_at: "2024-01-01T12:00:00"
+                    last_updated: "2024-01-01T12:00:00"
+                    api_calls_made: 1
+                    collection_errors: []
+                    tags:
+                      Name: "main-vpc"
+                      Environment: "production"
+                  cidr_blocks:
+                    - "10.0.0.0/16"
+                  properties:
+                    state: "available"
+                    is_default: false
+                    dhcp_options_id: "dopt-abc123"
+                    instance_tenancy: "default"
+                    additional_cidr_blocks: []
+
+              subnet:
+                "subnet-def456":
+                  resource_id: "subnet-def456"
+                  resource_type: "subnet"
+                  name: "public-subnet-1a"
+                  arn: "arn:aws:ec2:us-east-1:123456789012:subnet/subnet-def456"
+                  location:
+                    account_id: "123456789012"
+                    region: "us-east-1"
+                    availability_zone: "us-east-1a"
+                  metadata:
+                    discovered_at: "2024-01-01T12:00:00"
+                    last_updated: "2024-01-01T12:00:00"
+                    api_calls_made: 1
+                    collection_errors: []
+                    tags:
+                      Name: "public-subnet-1a"
+                      Type: "public"
+                  cidr_blocks:
+                    - "10.0.1.0/24"
+                  properties:
+                    vpc_id: "vpc-abc123"
+                    availability_zone: "us-east-1a"
+                    state: "available"
+                    map_public_ip_on_launch: true
+                    available_ip_address_count: 251
+
+                "subnet-ghi789":
+                  resource_id: "subnet-ghi789"
+                  resource_type: "subnet"
+                  name: "private-subnet-1a"
+                  arn: "arn:aws:ec2:us-east-1:123456789012:subnet/subnet-ghi789"
+                  location:
+                    account_id: "123456789012"
+                    region: "us-east-1"
+                    availability_zone: "us-east-1a"
+                  metadata:
+                    discovered_at: "2024-01-01T12:00:00"
+                    last_updated: "2024-01-01T12:00:00"
+                    api_calls_made: 1
+                    collection_errors: []
+                    tags:
+                      Name: "private-subnet-1a"
+                      Type: "private"
+                  cidr_blocks:
+                    - "10.0.2.0/24"
+                  properties:
+                    vpc_id: "vpc-abc123"
+                    availability_zone: "us-east-1a"
+                    state: "available"
+                    map_public_ip_on_launch: false
+                    available_ip_address_count: 251
+
+              internet_gateway:
+                "igw-jkl012":
+                  resource_id: "igw-jkl012"
+                  resource_type: "internet_gateway"
+                  name: "main-igw"
+                  arn: "arn:aws:ec2:us-east-1:123456789012:internet-gateway/igw-jkl012"
+                  location:
+                    account_id: "123456789012"
+                    region: "us-east-1"
+                    availability_zone: null
+                  metadata:
+                    discovered_at: "2024-01-01T12:00:00"
+                    last_updated: "2024-01-01T12:00:00"
+                    api_calls_made: 1
+                    collection_errors: []
+                    tags:
+                      Name: "main-igw"
+                  properties:
+                    attachments:
+                      - VpcId: "vpc-abc123"
+                        State: "available"
+
+              nat_gateway:
+                "nat-mno345":
+                  resource_id: "nat-mno345"
+                  resource_type: "nat_gateway"
+                  name: "main-nat"
+                  arn: "arn:aws:ec2:us-east-1:123456789012:nat-gateway/nat-mno345"
+                  location:
+                    account_id: "123456789012"
+                    region: "us-east-1"
+                    availability_zone: null
+                  metadata:
+                    discovered_at: "2024-01-01T12:00:00"
+                    last_updated: "2024-01-01T12:00:00"
+                    api_calls_made: 1
+                    collection_errors: []
+                    tags:
+                      Name: "main-nat"
+                  properties:
+                    subnet_id: "subnet-def456"
+                    vpc_id: "vpc-abc123"
+                    state: "available"
+                    connectivity_type: "public"
+
+            relationships:
+              - source_id: "vpc-abc123"
+                target_id: "subnet-def456"
+                relationship_type: "contains"
+                properties: {}
+              - source_id: "vpc-abc123"
+                target_id: "subnet-ghi789"
+                relationship_type: "contains"
+                properties: {}
+              - source_id: "igw-jkl012"
+                target_id: "vpc-abc123"
+                relationship_type: "attached_to"
+                properties:
+                  state: "available"
+              - source_id: "subnet-def456"
+                target_id: "nat-mno345"
+                relationship_type: "contains"
+                properties: {}
+
+        cross_region_relationships: []
+
+    cross_account_relationships: []
+
+  data_sources:
+    collection_method: "aws_api"
+    collectors_used:
+      - "VPCCollector"
+    authentication_method: "cross_account_role"

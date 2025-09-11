@@ -1,0 +1,58 @@
+view_definition:
+  name: "Single VPC Detailed View"
+  description: "Comprehensive view of a single VPC including all associated resources"
+  
+  filters:
+    - type: "vpc"
+      values: ["vpc-REPLACE_WITH_VPC_ID"]
+      include: true
+    
+    # Optional: Restrict to specific account
+    # - type: "account" 
+    #   values: ["123456789012"]
+    #   include: true
+    
+    # Optional: Restrict to specific region
+    # - type: "region"
+    #   values: ["us-east-1"]
+    #   include: true
+  
+  include_resource_types:
+    - "vpc"
+    - "subnet"
+    - "security_group"
+    - "network_acl"
+    - "route_table"
+    - "internet_gateway"
+    - "nat_gateway"
+    - "vpc_endpoint"
+    - "ec2_instance"
+    - "load_balancer"
+    - "target_group"
+    - "rds_instance"
+    - "elasticache_cluster"
+  
+  include_relationship_types:
+    - "contains"
+    - "attached_to"
+    - "routes_to"
+    - "allows"
+    - "targets"
+    - "member_of"
+  
+  grouping_criteria:
+    - "availability_zone"
+    - "resource_type"
+    - "subnet_type"  # public/private from tags
+  
+  output_options:
+    show_ip_addresses: true
+    show_security_group_rules: true
+    show_route_details: true
+    group_by_subnet_type: true
+    
+  diagram_layout:
+    style: "hierarchical"
+    direction: "top-to-bottom"
+    group_subnets_by_az: true
+    show_connectivity_lines: true

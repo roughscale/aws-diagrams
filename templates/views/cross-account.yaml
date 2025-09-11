@@ -1,0 +1,46 @@
+view_definition:
+  name: "Cross-Account Connectivity"
+  description: "High-level view showing VPC connections across AWS accounts"
+  
+  filters:
+    # Include all accounts - no account filters
+    
+    # Optional: Restrict to specific regions
+    # - type: "region"
+    #   values: ["us-east-1", "us-west-2"] 
+    #   include: true
+    
+    # Optional: Filter by specific tags
+    # - type: "tag"
+    #   values: ["Environment=production", "NetworkTier=core"]
+    #   include: true
+  
+  include_resource_types:
+    - "vpc"
+    - "transit_gateway"
+    - "vpc_peering"
+    - "internet_gateway"
+    - "nat_gateway"
+  
+  include_relationship_types:
+    - "peers_with"
+    - "connects_to"
+    - "attached_to"
+  
+  grouping_criteria:
+    - "account_id"
+    - "region"
+    - "network_tier"  # from tags
+  
+  output_options:
+    show_cidr_blocks: true
+    show_account_names: true
+    show_region_boundaries: true
+    aggregate_similar_connections: true
+    
+  diagram_layout:
+    style: "network"
+    direction: "left-to-right"
+    group_by_account: true
+    show_cross_account_arrows: true
+    highlight_external_connections: true

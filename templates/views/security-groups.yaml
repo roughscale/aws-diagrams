@@ -1,0 +1,55 @@
+view_definition:
+  name: "Security Group Relationships"
+  description: "Security groups and their relationships to compute resources"
+  
+  filters:
+    # Optional: Focus on specific VPCs
+    # - type: "vpc"
+    #   values: ["vpc-abc123", "vpc-def456"]
+    #   include: true
+    
+    # Optional: Filter by environment tag
+    # - type: "tag"
+    #   values: ["Environment=production"]
+    #   include: true
+    
+    # Optional: Exclude default security groups
+    # - type: "tag"
+    #   values: ["aws:cloudformation:logical-id=default"]
+    #   include: false
+  
+  include_resource_types:
+    - "security_group"
+    - "ec2_instance"
+    - "load_balancer"
+    - "rds_instance"
+    - "elasticache_cluster"
+    - "ecs_service"
+    - "lambda_function"
+    - "vpc"
+    - "subnet"
+  
+  include_relationship_types:
+    - "member_of"
+    - "allows"
+    - "contains"
+    - "attached_to"
+  
+  grouping_criteria:
+    - "vpc_id"
+    - "security_group_type"  # from naming or tags
+    - "application_tier"     # from tags
+  
+  output_options:
+    show_security_group_rules: true
+    show_port_ranges: true
+    show_source_destinations: true
+    group_by_application: true
+    highlight_overly_permissive: true
+    
+  diagram_layout:
+    style: "force-directed"
+    direction: "radial"
+    cluster_by_vpc: true
+    show_rule_details: true
+    color_by_access_level: true

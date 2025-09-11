@@ -1,0 +1,525 @@
+"""
+VPC collector for discovering VPC resources and their relationships.
+
+This collector discovers VPCs, subnets, route tables, internet gateways,
+NAT gateways, security groups, and their interconnections.
+"""
+
+from typing import Set, List, Dict, Any, Optional
+import logging
+
+try:
+    from .base_collector import BaseCollector
+    from ..topology.schema import (
+        ResourceType, NetworkResource, BaseResource, Relationship, RelationshipType,
+        create_vpc_resource
+    )
+except ImportError:
+    from collectors.base_collector import BaseCollector
+    from topology.schema import (
+        ResourceType, NetworkResource, BaseResource, Relationship, RelationshipType,
+        create_vpc_resource
+    )
+
+logger = logging.getLogger(__name__)
+
+
+class VPCCollector(BaseCollector):
+    """Collector for VPC-related resources."""
+    
+    @property
+    def supported_resource_types(self) -> Set[ResourceType]:
+        """Return the set of resource types this collector can discover."""
+        return {
+            ResourceType.VPC,
+            ResourceType.SUBNET,
+            ResourceType.SECURITY_GROUP,
+            ResourceType.NETWORK_ACL,
+            ResourceType.ROUTE_TABLE,
+            ResourceType.INTERNET_GATEWAY,
+            ResourceType.NAT_GATEWAY,
+            ResourceType.VPC_ENDPOINT
+        }
+    
+    @property
+    def required_permissions(self) -> List[str]:
+        """Return the list of IAM permissions required by this collector."""
+        return [
+            'ec2:DescribeVpcs',
+            'ec2:DescribeSubnets',
+            'ec2:DescribeSecurityGroups',
+            'ec2:DescribeNetworkAcls',
+            'ec2:DescribeRouteTables',
+            'ec2:DescribeInternetGateways',
+            'ec2:DescribeNatGateways',
+            'ec2:DescribeVpcEndpoints',
+            'ec2:DescribeVpcPeeringConnections'
+        ]
+    
+    def collect_resources(self) -> None:
+        """Collect VPC-related resources."""
+        ec2 = self.get_client('ec2')
+        
+        # Collect VPCs first as they are the parent resources
+        self._collect_vpcs(ec2)
+        
+        # Collect VPC-dependent resources
+        self._collect_subnets(ec2)
+        self._collect_security_groups(ec2)
+        self._collect_network_acls(ec2)
+        self._collect_route_tables(ec2)
+        self._collect_internet_gateways(ec2)
+        self._collect_nat_gateways(ec2)
+        self._collect_vpc_endpoints(ec2)
+    
+    def _collect_vpcs(self, ec2_client: Any) -> None:
+        """Collect VPC resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_vpcs')
+            if not response:
+                return
+            
+            for vpc_data in response.get('Vpcs', []):
+                vpc_id = vpc_data['VpcId']
+                cidr_block = vpc_data['CidrBlock']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in vpc_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create VPC resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                vpc_resource = NetworkResource(
+                    resource_id=vpc_id,
+                    resource_type=ResourceType.VPC,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:vpc/{vpc_id}",
+                    location=location,
+                    metadata=metadata,
+                    cidr_blocks=[cidr_block],
+                    properties={
+                        'state': vpc_data.get('State'),
+                        'is_default': vpc_data.get('IsDefault', False),
+                        'dhcp_options_id': vpc_data.get('DhcpOptionsId'),
+                        'instance_tenancy': vpc_data.get('InstanceTenancy'),
+                        'additional_cidr_blocks': [
+                            assoc['CidrBlock'] 
+                            for assoc in vpc_data.get('CidrBlockAssociationSet', [])
+                            if assoc.get('CidrBlockState', {}).get('State') == 'associated'
+                        ]
+                    }
+                )
+                
+                self.add_resource(vpc_resource)
+                logger.debug(f"Collected VPC: {vpc_id} ({name or 'unnamed'})")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect VPCs: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_subnets(self, ec2_client: Any) -> None:
+        """Collect subnet resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_subnets')
+            if not response:
+                return
+            
+            for subnet_data in response.get('Subnets', []):
+                subnet_id = subnet_data['SubnetId']
+                vpc_id = subnet_data['VpcId']
+                cidr_block = subnet_data['CidrBlock']
+                az = subnet_data['AvailabilityZone']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in subnet_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create subnet resource
+                location = self.create_resource_location(availability_zone=az)
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                subnet_resource = NetworkResource(
+                    resource_id=subnet_id,
+                    resource_type=ResourceType.SUBNET,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:subnet/{subnet_id}",
+                    location=location,
+                    metadata=metadata,
+                    cidr_blocks=[cidr_block],
+                    properties={
+                        'vpc_id': vpc_id,
+                        'availability_zone': az,
+                        'availability_zone_id': subnet_data.get('AvailabilityZoneId'),
+                        'state': subnet_data.get('State'),
+                        'map_public_ip_on_launch': subnet_data.get('MapPublicIpOnLaunch', False),
+                        'assign_ipv6_address_on_creation': subnet_data.get('AssignIpv6AddressOnCreation', False),
+                        'available_ip_address_count': subnet_data.get('AvailableIpAddressCount', 0)
+                    }
+                )
+                
+                self.add_resource(subnet_resource)
+                
+                # Create relationship to VPC
+                vpc_relationship = Relationship(
+                    source_id=vpc_id,
+                    target_id=subnet_id,
+                    relationship_type=RelationshipType.CONTAINS
+                )
+                self.add_relationship(vpc_relationship)
+                
+                logger.debug(f"Collected subnet: {subnet_id} in VPC {vpc_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect subnets: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_security_groups(self, ec2_client: Any) -> None:
+        """Collect security group resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_security_groups')
+            if not response:
+                return
+            
+            for sg_data in response.get('SecurityGroups', []):
+                sg_id = sg_data['GroupId']
+                vpc_id = sg_data.get('VpcId')
+                
+                # Extract name and tags
+                name = sg_data.get('GroupName')
+                tags = {}
+                for tag in sg_data.get('Tags', []):
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create security group resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                sg_resource = BaseResource(
+                    resource_id=sg_id,
+                    resource_type=ResourceType.SECURITY_GROUP,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:security-group/{sg_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'group_name': name,
+                        'description': sg_data.get('Description'),
+                        'vpc_id': vpc_id,
+                        'owner_id': sg_data.get('OwnerId'),
+                        'ingress_rules': sg_data.get('IpPermissions', []),
+                        'egress_rules': sg_data.get('IpPermissionsEgress', [])
+                    }
+                )
+                
+                self.add_resource(sg_resource)
+                
+                # Create relationship to VPC if it exists
+                if vpc_id and vpc_id in self.collected_resources:
+                    vpc_relationship = Relationship(
+                        source_id=vpc_id,
+                        target_id=sg_id,
+                        relationship_type=RelationshipType.CONTAINS
+                    )
+                    self.add_relationship(vpc_relationship)
+                
+                logger.debug(f"Collected security group: {sg_id} ({name})")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect security groups: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_network_acls(self, ec2_client: Any) -> None:
+        """Collect Network ACL resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_network_acls')
+            if not response:
+                return
+            
+            for nacl_data in response.get('NetworkAcls', []):
+                nacl_id = nacl_data['NetworkAclId']
+                vpc_id = nacl_data['VpcId']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in nacl_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create network ACL resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                nacl_resource = BaseResource(
+                    resource_id=nacl_id,
+                    resource_type=ResourceType.NETWORK_ACL,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:network-acl/{nacl_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'vpc_id': vpc_id,
+                        'is_default': nacl_data.get('IsDefault', False),
+                        'entries': nacl_data.get('Entries', []),
+                        'associations': nacl_data.get('Associations', [])
+                    }
+                )
+                
+                self.add_resource(nacl_resource)
+                
+                # Create relationship to VPC
+                vpc_relationship = Relationship(
+                    source_id=vpc_id,
+                    target_id=nacl_id,
+                    relationship_type=RelationshipType.CONTAINS
+                )
+                self.add_relationship(vpc_relationship)
+                
+                logger.debug(f"Collected Network ACL: {nacl_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect Network ACLs: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_route_tables(self, ec2_client: Any) -> None:
+        """Collect route table resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_route_tables')
+            if not response:
+                return
+            
+            for rt_data in response.get('RouteTables', []):
+                rt_id = rt_data['RouteTableId']
+                vpc_id = rt_data['VpcId']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in rt_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create route table resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                rt_resource = BaseResource(
+                    resource_id=rt_id,
+                    resource_type=ResourceType.ROUTE_TABLE,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:route-table/{rt_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'vpc_id': vpc_id,
+                        'routes': rt_data.get('Routes', []),
+                        'associations': rt_data.get('Associations', []),
+                        'propagating_vgws': rt_data.get('PropagatingVgws', [])
+                    }
+                )
+                
+                self.add_resource(rt_resource)
+                
+                # Create relationship to VPC
+                vpc_relationship = Relationship(
+                    source_id=vpc_id,
+                    target_id=rt_id,
+                    relationship_type=RelationshipType.CONTAINS
+                )
+                self.add_relationship(vpc_relationship)
+                
+                logger.debug(f"Collected route table: {rt_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect route tables: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_internet_gateways(self, ec2_client: Any) -> None:
+        """Collect Internet Gateway resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_internet_gateways')
+            if not response:
+                return
+            
+            for igw_data in response.get('InternetGateways', []):
+                igw_id = igw_data['InternetGatewayId']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in igw_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create internet gateway resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                igw_resource = BaseResource(
+                    resource_id=igw_id,
+                    resource_type=ResourceType.INTERNET_GATEWAY,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:internet-gateway/{igw_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'attachments': igw_data.get('Attachments', [])
+                    }
+                )
+                
+                self.add_resource(igw_resource)
+                
+                # Create relationships to attached VPCs
+                for attachment in igw_data.get('Attachments', []):
+                    vpc_id = attachment.get('VpcId')
+                    if vpc_id and attachment.get('State') == 'available':
+                        attachment_relationship = Relationship(
+                            source_id=igw_id,
+                            target_id=vpc_id,
+                            relationship_type=RelationshipType.ATTACHED_TO,
+                            properties={'state': attachment.get('State')}
+                        )
+                        self.add_relationship(attachment_relationship)
+                
+                logger.debug(f"Collected Internet Gateway: {igw_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect Internet Gateways: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_nat_gateways(self, ec2_client: Any) -> None:
+        """Collect NAT Gateway resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_nat_gateways')
+            if not response:
+                return
+            
+            for nat_data in response.get('NatGateways', []):
+                nat_id = nat_data['NatGatewayId']
+                subnet_id = nat_data.get('SubnetId')
+                vpc_id = nat_data.get('VpcId')
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in nat_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create NAT gateway resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                nat_resource = BaseResource(
+                    resource_id=nat_id,
+                    resource_type=ResourceType.NAT_GATEWAY,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:nat-gateway/{nat_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'subnet_id': subnet_id,
+                        'vpc_id': vpc_id,
+                        'state': nat_data.get('State'),
+                        'nat_gateway_addresses': nat_data.get('NatGatewayAddresses', []),
+                        'connectivity_type': nat_data.get('ConnectivityType'),
+                        'failure_reason': nat_data.get('FailureReason')
+                    }
+                )
+                
+                self.add_resource(nat_resource)
+                
+                # Create relationship to subnet
+                if subnet_id:
+                    subnet_relationship = Relationship(
+                        source_id=subnet_id,
+                        target_id=nat_id,
+                        relationship_type=RelationshipType.CONTAINS
+                    )
+                    self.add_relationship(subnet_relationship)
+                
+                logger.debug(f"Collected NAT Gateway: {nat_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect NAT Gateways: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+    
+    def _collect_vpc_endpoints(self, ec2_client: Any) -> None:
+        """Collect VPC Endpoint resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_vpc_endpoints')
+            if not response:
+                return
+            
+            for endpoint_data in response.get('VpcEndpoints', []):
+                endpoint_id = endpoint_data['VpcEndpointId']
+                vpc_id = endpoint_data['VpcId']
+                
+                # Extract name from tags
+                name = None
+                tags = {}
+                for tag in endpoint_data.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                
+                # Create VPC endpoint resource
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                
+                endpoint_resource = BaseResource(
+                    resource_id=endpoint_id,
+                    resource_type=ResourceType.VPC_ENDPOINT,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:vpc-endpoint/{endpoint_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'vpc_id': vpc_id,
+                        'service_name': endpoint_data.get('ServiceName'),
+                        'vpc_endpoint_type': endpoint_data.get('VpcEndpointType'),
+                        'state': endpoint_data.get('State'),
+                        'route_table_ids': endpoint_data.get('RouteTableIds', []),
+                        'subnet_ids': endpoint_data.get('SubnetIds', []),
+                        'security_group_ids': endpoint_data.get('Groups', []),
+                        'dns_entries': endpoint_data.get('DnsEntries', [])
+                    }
+                )
+                
+                self.add_resource(endpoint_resource)
+                
+                # Create relationship to VPC
+                vpc_relationship = Relationship(
+                    source_id=vpc_id,
+                    target_id=endpoint_id,
+                    relationship_type=RelationshipType.CONTAINS
+                )
+                self.add_relationship(vpc_relationship)
+                
+                logger.debug(f"Collected VPC Endpoint: {endpoint_id}")
+                
+        except Exception as e:
+            error_msg = f"Failed to collect VPC Endpoints: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
