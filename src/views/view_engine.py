@@ -343,6 +343,77 @@ class ViewEngine:
                 source_resource = all_resources.get(relationship.source_id)
                 if source_resource:
                     vpc_resources[relationship.source_id] = source_resource
+
+        # Include VPC peering connection resources that involve this VPC
+        for resource_id, resource in all_resources.items():
+            try:
+                rtype = resource.resource_type
+            except Exception:
+                rtype = None
+            if rtype == ResourceType.VPC_PEERING:
+                req_vpc = (resource.properties.get('requester_vpc') or {}).get('VpcId')
+                acc_vpc = (resource.properties.get('accepter_vpc') or {}).get('VpcId')
+                if vpc_id in {req_vpc, acc_vpc}:
+                    vpc_resources[resource_id] = resource
+
+        # Include Transit Gateways connected to this VPC
+        for relationship in all_relationships:
+            if relationship.relationship_type == RelationshipType.CONNECTS_TO:
+                if relationship.source_id == vpc_id:
+                    other_id = relationship.target_id
+                elif relationship.target_id == vpc_id:
+                    other_id = relationship.source_id
+                else:
+                    other_id = None
+                if other_id and other_id in all_resources:
+                    other_res = all_resources[other_id]
+                    if other_res.resource_type == ResourceType.TRANSIT_GATEWAY:
+                        vpc_resources[other_id] = other_res
+
+        # Include peered VPCs; if missing from topology, create a bare synthetic one
+        from datetime import datetime
+        if True:
+            for relationship in all_relationships:
+                if relationship.relationship_type == RelationshipType.PEERS_WITH:
+                    if relationship.source_id == vpc_id:
+                        peer_id = relationship.target_id
+                    elif relationship.target_id == vpc_id:
+                        peer_id = relationship.source_id
+                    else:
+                        peer_id = None
+                    if not peer_id:
+                        continue
+                    if peer_id in all_resources:
+                        peer_res = all_resources[peer_id]
+                        if peer_res.resource_type == ResourceType.VPC:
+                            vpc_resources[peer_id] = peer_res
+                    else:
+                        # Create a bare VPC container using info from VPC Peering resource
+                        # Find the peering resource to extract account/region if available
+                        for rid, res in all_resources.items():
+                            if getattr(res, 'resource_type', None) == ResourceType.VPC_PEERING:
+                                req = (res.properties.get('requester_vpc') or {})
+                                acc = (res.properties.get('accepter_vpc') or {})
+                                if req.get('VpcId') == peer_id or acc.get('VpcId') == peer_id:
+                                    # Build a synthetic VPC BaseResource
+                                    from topology.schema import ResourceLocation, ResourceMetadata, BaseResource, ResourceType as RT
+                                    # Prefer the matching side for account/region
+                                    side = req if req.get('VpcId') == peer_id else acc
+                                    account = side.get('OwnerId', 'unknown')
+                                    region = side.get('Region', 'unknown')
+                                    location = ResourceLocation(account_id=str(account), region=str(region))
+                                    meta = ResourceMetadata(discovered_at=datetime.now(), last_updated=datetime.now())
+                                    synthetic = BaseResource(
+                                        resource_id=peer_id,
+                                        resource_type=RT.VPC,
+                                        name=peer_id,
+                                        arn="",
+                                        location=location,
+                                        metadata=meta,
+                                        properties={}
+                                    )
+                                    vpc_resources[peer_id] = synthetic
+                                    break
         
         # Apply account and region filters if specified
         if account_id:

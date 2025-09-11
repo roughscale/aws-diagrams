@@ -8,6 +8,7 @@ AWS Labs diagram-as-code format: https://github.com/awslabs/diagram-as-code
 """
 
 from typing import Dict, List, Any, Optional, Set, Tuple
+import math
 from dataclasses import dataclass
 import logging
 
@@ -93,6 +94,7 @@ class AWSLabsTransformer:
         self.nodes: Dict[str, DiagramNode] = {}
         self.connections: List[DiagramConnection] = []
         self.groups: Dict[str, List[str]] = {}
+        self.primary_vpc_id: Optional[str] = self._extract_primary_vpc_id()
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -332,7 +334,20 @@ class AWSLabsTransformer:
     
     def _generate_diagram_structure(self) -> Dict[str, Any]:
         """Generate the final AWS Labs diagram-as-code structure."""
-        # Create the main canvas and cloud structure
+        # Determine VPCs and Network Core (TGWs only)
+        vpc_ids = list(self._get_vpc_children())
+        # If single-VPC view, keep peers out of the top-level row
+        primary_peers: List[str] = []
+        if self.primary_vpc_id and self.primary_vpc_id in vpc_ids:
+            primary_peers = [peer for _, peer in self._find_vpc_peerings(self.primary_vpc_id)
+                             if peer in vpc_ids]
+            vpc_ids = [vid for vid in vpc_ids if vid not in set(primary_peers)]
+
+        network_core_children = []
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type in [ResourceType.TRANSIT_GATEWAY]:
+                network_core_children.append(resource_id)
+
         resources = {
             "Canvas": {
                 "Type": "AWS::Diagram::Canvas",
@@ -344,9 +359,32 @@ class AWSLabsTransformer:
                 "Direction": "vertical", 
                 "Preset": "AWSCloudNoLogo",
                 "Align": "center",
-                "Children": self._get_vpc_children()
+                "Children": []
             }
         }
+
+        # Create a horizontal row: VPCs (left) and Network Core (right)
+        # Stack of VPCs
+        resources["VPCsStack"] = {
+            "Type": "AWS::Diagram::HorizontalStack",
+            "Children": vpc_ids
+        }
+
+        row_children = ["VPCsStack"]
+        if network_core_children:
+            resources["NetworkCore"] = {
+                "Type": "AWS::Diagram::HorizontalStack",
+                "Title": "Network Core",
+                "Children": network_core_children
+            }
+            row_children.append("NetworkCore")
+
+        resources["VpcRow"] = {
+            "Type": "AWS::Diagram::HorizontalStack",
+            "Children": row_children
+        }
+
+        resources["AWSCloud"]["Children"].append("VpcRow")
         
         # Add VPC resources
         self._add_vpc_resources(resources)
@@ -389,7 +427,7 @@ class AWSLabsTransformer:
             if resource.resource_type == ResourceType.VPC:
                 # Create VPC structure with proper layout
                 vpc_children = []
-                
+
                 # Add Internet Gateway as border child (external to VPC)
                 border_children = []
                 igw_id = self._find_internet_gateway(resource_id)
@@ -398,24 +436,41 @@ class AWSLabsTransformer:
                         "Position": "N",
                         "Resource": igw_id
                     })
+
                 
                 # Create availability zone stacks
                 az_stacks = self._create_az_stacks(resource_id)
                 vpc_children.extend(az_stacks)
                 
-                # Add VPC endpoints as children
+                # Add VPC endpoints as a single container arranged roughly square
                 vpc_endpoints = self._find_vpc_endpoints(resource_id)
                 if vpc_endpoints:
-                    # Group VPC endpoints
-                    if len(vpc_endpoints) > 1:
-                        endpoint_stack_id = f"{resource_id}-vpc-endpoints"
-                        vpc_children.append(endpoint_stack_id)
-                        resources[endpoint_stack_id] = {
-                            "Type": "AWS::Diagram::HorizontalStack",
-                            "Children": vpc_endpoints
-                        }
-                    else:
+                    if len(vpc_endpoints) == 1:
                         vpc_children.extend(vpc_endpoints)
+                    else:
+                        n = len(vpc_endpoints)
+                        rows = max(1, int(math.ceil(math.sqrt(n))))
+                        cols = max(1, int(math.ceil(n / rows)))
+                        ep_row_ids: List[str] = []
+                        for i in range(rows):
+                            start = i * cols
+                            end = start + cols
+                            row_children = vpc_endpoints[start:end]
+                            if not row_children:
+                                continue
+                            row_id = f"{resource_id}-endpoints-row-{i+1}"
+                            ep_row_ids.append(row_id)
+                            resources[row_id] = {
+                                "Type": "AWS::Diagram::HorizontalStack",
+                                "Children": row_children
+                            }
+                        endpoint_stack_id = f"{resource_id}-vpc-endpoints"
+                        resources[endpoint_stack_id] = {
+                            "Type": "AWS::Diagram::VerticalStack",
+                            "Title": "VPC Endpoints",
+                            "Children": ep_row_ids
+                        }
+                        vpc_children.append(endpoint_stack_id)
                 
                 resources[resource_id] = {
                     "Type": "AWS::EC2::VPC",
@@ -423,9 +478,26 @@ class AWSLabsTransformer:
                     "Title": resource.name or resource_id,
                     "Children": vpc_children
                 }
-                
+
                 if border_children:
                     resources[resource_id]["BorderChildren"] = border_children
+
+                # If this is the primary VPC, place any peered VPC containers underneath
+                if self.primary_vpc_id and resource_id == self.primary_vpc_id:
+                    peer_vpcs = [peer for _, peer in self._find_vpc_peerings(resource_id)]
+                    # Only include peers that exist as resources; synthetic peers should be present from the view
+                    peer_vpcs = [p for p in peer_vpcs if p in self.view.filtered_resources]
+                    if peer_vpcs:
+                        # Build a vertical stack with the primary VPC on top and peers below
+                        panel_id = f"{resource_id}-panel"
+                        resources[panel_id] = {
+                            "Type": "AWS::Diagram::VerticalStack",
+                            "Children": [resource_id] + peer_vpcs
+                        }
+                        # Replace the VPC with panel in top-level VPCs stack
+                        if "VPCsStack" in resources:
+                            children = resources["VPCsStack"].get("Children", [])
+                            resources["VPCsStack"]["Children"] = [panel_id if c == resource_id else c for c in children]
     
     def _add_aws_resources(self, resources: Dict[str, Any]) -> None:
         """Add AWS resources to the diagram."""
@@ -451,11 +523,13 @@ class AWSLabsTransformer:
                 else:
                     resource_def["Preset"] = "PrivateSubnet"
                     
-                # Find NAT Gateways and other resources in this subnet
+                # Find resources in this subnet
                 subnet_children = []
                 for child_id, child in self.view.filtered_resources.items():
                     if child.properties.get('subnet_id') == resource_id:
-                        if child.resource_type in [ResourceType.NAT_GATEWAY, ResourceType.EC2_INSTANCE]:
+                        # Only attach EC2 instances here. NAT Gateways are grouped
+                        # at the logical subnet group level to avoid cycles.
+                        if child.resource_type in [ResourceType.EC2_INSTANCE]:
                             subnet_children.append(child_id)
                 if subnet_children:
                     resource_def["Children"] = subnet_children
@@ -471,8 +545,11 @@ class AWSLabsTransformer:
                     resource_def["Title"] = f"VPC Endpoint\n({service_name})"
                     
             elif resource.resource_type == ResourceType.NAT_GATEWAY:
-                # NAT Gateway preset
-                resource_def["Preset"] = "NAT Gateway"
+                # Keep default rendering; avoid unsupported preset names
+                pass
+            elif resource.resource_type == ResourceType.VPC_PEERING:
+                # Skip standalone peering nodes; we render peering indicators under VPC panels
+                continue
             
             resources[resource_id] = resource_def
     
@@ -487,7 +564,15 @@ class AWSLabsTransformer:
                 relationship.source_id not in self.view.filtered_resources or
                 relationship.target_id not in self.view.filtered_resources):
                 continue
-                
+
+            # Remove TGW <-> Subnet links (attachments are displayed separately)
+            src_res = self.view.filtered_resources.get(relationship.source_id)
+            tgt_res = self.view.filtered_resources.get(relationship.target_id)
+            if (relationship.relationship_type == RelationshipType.CONNECTS_TO and src_res and tgt_res and
+                ((src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.SUBNET) or
+                 (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.SUBNET))):
+                continue
+
             link = {
                 "Source": relationship.source_id,
                 "Target": relationship.target_id,
@@ -495,7 +580,7 @@ class AWSLabsTransformer:
                 "SourcePosition": "N",
                 "TargetPosition": "S"
             }
-            
+
             # Add label based on relationship type
             if relationship.relationship_type == RelationshipType.ATTACHED_TO:
                 link["Labels"] = {
@@ -505,9 +590,32 @@ class AWSLabsTransformer:
                 link["Labels"] = {
                     "SourceLeft": {"Title": "routes"}
                 }
-            
+
+            # Special positioning for TGW<->VPC links: draw horizontally to VPC right side
+            if (relationship.relationship_type == RelationshipType.CONNECTS_TO and src_res and tgt_res and
+                ((src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.VPC) or
+                 (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.VPC))):
+                if src_res.resource_type == ResourceType.TRANSIT_GATEWAY:
+                    link["SourcePosition"] = "W"
+                    link["TargetPosition"] = "E"
+                else:
+                    link["SourcePosition"] = "E"
+                    link["TargetPosition"] = "W"
+
+            # For primary VPC peering to a peer placed underneath, draw vertical link
+            if (relationship.relationship_type == RelationshipType.PEERS_WITH and src_res and tgt_res and
+                src_res.resource_type == ResourceType.VPC and tgt_res.resource_type == ResourceType.VPC and
+                self.primary_vpc_id is not None and
+                (src_res.resource_id == self.primary_vpc_id or tgt_res.resource_id == self.primary_vpc_id)):
+                if src_res.resource_id == self.primary_vpc_id:
+                    link["SourcePosition"] = "S"
+                    link["TargetPosition"] = "N"
+                else:
+                    link["SourcePosition"] = "N"
+                    link["TargetPosition"] = "S"
+
             links.append(link)
-        
+
         return links
     
     def _find_internet_gateway(self, vpc_id: str) -> Optional[str]:
@@ -518,6 +626,55 @@ class AWSLabsTransformer:
                 source_resource = self.view.filtered_resources.get(relationship.source_id)
                 if source_resource and source_resource.resource_type == ResourceType.INTERNET_GATEWAY:
                     return relationship.source_id
+        return None
+
+    def _find_transit_gateways_for_vpc(self, vpc_id: str) -> List[str]:
+        """Find Transit Gateways connected to a VPC."""
+        tgws: List[str] = []
+        for relationship in self.view.filtered_relationships:
+            if relationship.relationship_type != RelationshipType.CONNECTS_TO:
+                continue
+            src = self.view.filtered_resources.get(relationship.source_id)
+            tgt = self.view.filtered_resources.get(relationship.target_id)
+            if not src or not tgt:
+                continue
+            # VPC <-> TGW connections
+            if ((src.resource_type == ResourceType.VPC and tgt.resource_type == ResourceType.TRANSIT_GATEWAY and src.resource_id == vpc_id)):
+                tgws.append(tgt.resource_id)
+            elif ((tgt.resource_type == ResourceType.VPC and src.resource_type == ResourceType.TRANSIT_GATEWAY and tgt.resource_id == vpc_id)):
+                tgws.append(src.resource_id)
+        # De-duplicate
+        return list(dict.fromkeys(tgws))
+
+    def _find_vpc_peerings(self, vpc_id: str) -> List[Tuple[str, str]]:
+        """Find VPC peering connections involving the given VPC.
+
+        Returns a list of tuples: (peering_resource_id, peer_vpc_id)
+        """
+        results: List[Tuple[str, str]] = []
+        for rid, res in self.view.filtered_resources.items():
+            if res.resource_type != ResourceType.VPC_PEERING:
+                continue
+            req = (res.properties.get('requester_vpc') or {})
+            acc = (res.properties.get('accepter_vpc') or {})
+            req_vpc = req.get('VpcId')
+            acc_vpc = acc.get('VpcId')
+            if req_vpc == vpc_id and acc_vpc:
+                results.append((rid, acc_vpc))
+            elif acc_vpc == vpc_id and req_vpc:
+                results.append((rid, req_vpc))
+        return results
+
+    def _extract_primary_vpc_id(self) -> Optional[str]:
+        try:
+            fa = self.view.metadata.get('filters_applied', [])
+            for f in fa:
+                if f.get('type') == 'vpc':
+                    vals = f.get('values') or []
+                    if vals:
+                        return vals[0]
+        except Exception:
+            pass
         return None
     
     def _find_vpc_endpoints(self, vpc_id: str) -> List[str]:
@@ -620,18 +777,88 @@ class AWSLabsTransformer:
             return 'rgba(245,245,245,100)'  # Light gray for others
     
     def _create_subnet_group_children(self, group_name: str, subnets: List[str], resources: Dict[str, Any]) -> List[str]:
-        """Create child elements for subnet group (like NAT gateways, instances)."""
-        children = []
-        
-        # Find resources that belong in these subnets
+        """Create child elements for a logical subnet group.
+
+        - Group NAT Gateways into a single logical element under the subnet group.
+        - Group Transit Gateway attachments into a single logical element under the subnet group.
+        - Do not duplicate nodes under individual subnets to avoid cycles.
+        """
+        additions: List[str] = []
+
+        # Determine VPC id from the first subnet to generate stable group ids
+        vpc_id = None
+        if subnets:
+            first_subnet = self.view.filtered_resources.get(subnets[0])
+            if first_subnet:
+                vpc_id = first_subnet.properties.get('vpc_id')
+
+        # NAT Gateways group
+        nat_ids: List[str] = []
         for resource_id, resource in self.view.filtered_resources.items():
-            if (hasattr(resource, 'properties') and 
+            if (hasattr(resource, 'properties') and
+                resource.resource_type == ResourceType.NAT_GATEWAY and
                 resource.properties.get('subnet_id') in subnets):
-                # Add NAT gateways, instances, etc. that are in these subnets
-                if resource.resource_type in [ResourceType.NAT_GATEWAY, ResourceType.EC2_INSTANCE]:
-                    children.append(resource_id)
-        
-        return children
+                nat_ids.append(resource_id)
+
+        if nat_ids:
+            nat_group_id = f"{vpc_id or 'vpc'}-{group_name}-nat-group"
+            nat_children_stack_id = f"{nat_group_id}-children"
+            resources[nat_children_stack_id] = {
+                "Type": "AWS::Diagram::HorizontalStack",
+                "Children": nat_ids
+            }
+            resources[nat_group_id] = {
+                "Type": "AWS::Diagram::VerticalStack",
+                "Title": "NAT Gateways",
+                "Children": [nat_children_stack_id]
+            }
+            additions.append(nat_group_id)
+
+        # Transit Gateway attachments group: infer from CONNECTS_TO edges between subnets and TGW
+        tgw_attachment_ids: List[str] = []
+        # Keep mapping of synthetic id to TGW for potential future linking
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.CONNECTS_TO:
+                continue
+            src = self.view.filtered_resources.get(rel.source_id)
+            tgt = self.view.filtered_resources.get(rel.target_id)
+            if not src or not tgt:
+                continue
+            # Consider only subnet <-> TGW connections
+            if ((src.resource_type == ResourceType.SUBNET and tgt.resource_type == ResourceType.TRANSIT_GATEWAY and rel.source_id in subnets) or
+                (tgt.resource_type == ResourceType.SUBNET and src.resource_type == ResourceType.TRANSIT_GATEWAY and rel.target_id in subnets)):
+                subnet_id = rel.source_id if src.resource_type == ResourceType.SUBNET else rel.target_id
+                tgw_id = rel.target_id if tgt.resource_type == ResourceType.TRANSIT_GATEWAY else rel.source_id
+                # Create a stable synthetic attachment node id per (subnet, tgw)
+                attach_id = f"{subnet_id}-to-{tgw_id}-tgw-attach"
+                if attach_id not in resources:
+                    # Try to include the subnet AZ in the title
+                    az = None
+                    subnet_res = self.view.filtered_resources.get(subnet_id)
+                    if subnet_res and subnet_res.location and subnet_res.location.availability_zone:
+                        az = subnet_res.location.availability_zone
+                    title = f"TGW Attachment" + (f" ({az})" if az else "")
+                    resources[attach_id] = {
+                        "Type": "AWS::EC2::TransitGateway",
+                        "Title": title
+                    }
+                tgw_attachment_ids.append(attach_id)
+
+        if tgw_attachment_ids:
+            tgw_group_id = f"{vpc_id or 'vpc'}-{group_name}-tgw-attach-group"
+            tgw_children_stack_id = f"{tgw_group_id}-children"
+            resources[tgw_children_stack_id] = {
+                "Type": "AWS::Diagram::HorizontalStack",
+                "Children": tgw_attachment_ids
+            }
+            resources[tgw_group_id] = {
+                "Type": "AWS::Diagram::VerticalStack",
+                "Title": "TGW Attachments",
+                "Children": [tgw_children_stack_id]
+            }
+            additions.append(tgw_group_id)
+
+        return additions
     
     def _add_az_stacks(self, resources: Dict[str, Any]) -> None:
         """Add availability zone stacks with logical subnet grouping."""
@@ -665,6 +892,13 @@ class AWSLabsTransformer:
                     
                     # Add any resources that belong in these subnets (NAT gateways, instances)
                     group_children.extend(self._create_subnet_group_children(group_name, subnets, resources))
+
+                    # Within each logical subnet group, display children horizontally
+                    children_stack_id = f"{group_stack_id}-children"
+                    resources[children_stack_id] = {
+                        "Type": "AWS::Diagram::HorizontalStack",
+                        "Children": group_children
+                    }
                     
                     resources[group_stack_id] = {
                         "Type": "AWS::Diagram::VerticalStack",  # Use VerticalStack with styling for boundaries
@@ -672,14 +906,23 @@ class AWSLabsTransformer:
                         "FillColor": self._get_subnet_group_rgba_color(group_name),
                         "BorderColor": "rgba(0,0,0,255)",  # Solid black border
                         "Direction": "vertical",
-                        "Children": group_children
+                        "Children": [children_stack_id]
                     }
                 
-                # Create main subnet groups horizontal stack
+                # Order groups: put any 'public' logical group at the top
+                def _group_sort_key(stack_id: str) -> tuple:
+                    # stack_id format: f"{vpc_id}-{group_name}-group"
+                    group_name = stack_id[len(f"{vpc_id}-"): -len("-group")] if stack_id.endswith("-group") else stack_id
+                    is_public = 0 if 'public' in group_name.lower() else 1
+                    return (is_public, group_name)
+
+                ordered_group_stack_ids = sorted(group_stack_ids, key=_group_sort_key)
+
+                # Create main subnet groups vertical stack with ordered groups (no re-arrangement)
                 main_stack_id = f"{vpc_id}-azs"
                 resources[main_stack_id] = {
-                    "Type": "AWS::Diagram::HorizontalStack",
-                    "Children": group_stack_ids
+                    "Type": "AWS::Diagram::VerticalStack",
+                    "Children": ordered_group_stack_ids
                 }
     
     def save_to_file(self, filepath: str) -> None:

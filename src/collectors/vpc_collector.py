@@ -38,7 +38,9 @@ class VPCCollector(BaseCollector):
             ResourceType.ROUTE_TABLE,
             ResourceType.INTERNET_GATEWAY,
             ResourceType.NAT_GATEWAY,
-            ResourceType.VPC_ENDPOINT
+            ResourceType.VPC_ENDPOINT,
+            ResourceType.TRANSIT_GATEWAY,
+            ResourceType.VPC_PEERING
         }
     
     @property
@@ -53,7 +55,10 @@ class VPCCollector(BaseCollector):
             'ec2:DescribeInternetGateways',
             'ec2:DescribeNatGateways',
             'ec2:DescribeVpcEndpoints',
-            'ec2:DescribeVpcPeeringConnections'
+            'ec2:DescribeVpcPeeringConnections',
+            'ec2:DescribeTransitGateways',
+            'ec2:DescribeTransitGatewayAttachments',
+            'ec2:DescribeTransitGatewayVpcAttachments'
         ]
     
     def collect_resources(self) -> None:
@@ -71,6 +76,10 @@ class VPCCollector(BaseCollector):
         self._collect_internet_gateways(ec2)
         self._collect_nat_gateways(ec2)
         self._collect_vpc_endpoints(ec2)
+        self._collect_transit_gateways(ec2)
+        self._collect_transit_gateway_attachments(ec2)
+        self._collect_transit_gateway_vpc_attachments(ec2)
+        self._collect_vpc_peering_connections(ec2)
     
     def _collect_vpcs(self, ec2_client: Any) -> None:
         """Collect VPC resources."""
@@ -521,5 +530,165 @@ class VPCCollector(BaseCollector):
                 
         except Exception as e:
             error_msg = f"Failed to collect VPC Endpoints: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+
+    def _collect_transit_gateways(self, ec2_client: Any) -> None:
+        """Collect Transit Gateway resources."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_transit_gateways')
+            if not response:
+                return
+            for tgw in response.get('TransitGateways', []):
+                tgw_id = tgw['TransitGatewayId']
+                name = None
+                tags = {}
+                for tag in tgw.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                tgw_resource = BaseResource(
+                    resource_id=tgw_id,
+                    resource_type=ResourceType.TRANSIT_GATEWAY,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:transit-gateway/{tgw_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'state': tgw.get('State'),
+                        'owner_id': tgw.get('OwnerId'),
+                        'options': tgw.get('Options', {})
+                    }
+                )
+                self.add_resource(tgw_resource)
+                logger.debug(f"Collected Transit Gateway: {tgw_id}")
+        except Exception as e:
+            error_msg = f"Failed to collect Transit Gateways: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+
+    def _collect_transit_gateway_attachments(self, ec2_client: Any) -> None:
+        """Collect Transit Gateway Attachments and create relationships to subnets/VPCs."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_transit_gateway_attachments')
+            if not response:
+                return
+            for att in response.get('TransitGatewayAttachments', []):
+                tgw_id = att.get('TransitGatewayId')
+                resource_type = att.get('ResourceType')  # e.g., 'vpc'
+                resource_id = att.get('ResourceId')      # e.g., VPC ID
+                state = att.get('State')
+                # For VPC attachments, fetch the subnets used in the attachment
+                subnet_ids = []
+                assoc = att.get('Association', {})
+                if 'SubnetIds' in att:
+                    subnet_ids = att.get('SubnetIds', [])
+                elif assoc.get('SubnetId'):
+                    subnet_ids = [assoc['SubnetId']]
+
+                # Link VPC to TGW
+                if tgw_id and resource_id and resource_type == 'vpc':
+                    self.add_relationship(Relationship(
+                        source_id=resource_id,
+                        target_id=tgw_id,
+                        relationship_type=RelationshipType.CONNECTS_TO,
+                        properties={'state': state}
+                    ))
+
+                # Link participating subnets to TGW (per-AZ attachments)
+                for subnet_id in subnet_ids:
+                    self.add_relationship(Relationship(
+                        source_id=subnet_id,
+                        target_id=tgw_id,
+                        relationship_type=RelationshipType.CONNECTS_TO,
+                        properties={'state': state}
+                    ))
+            logger.debug("Collected Transit Gateway attachments and relationships")
+        except Exception as e:
+            error_msg = f"Failed to collect Transit Gateway Attachments: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+
+    def _collect_transit_gateway_vpc_attachments(self, ec2_client: Any) -> None:
+        """Collect Transit Gateway VPC Attachments to get per-AZ SubnetIds and link them to TGW."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_transit_gateway_vpc_attachments')
+            if not response:
+                return
+            for att in response.get('TransitGatewayVpcAttachments', []):
+                tgw_id = att.get('TransitGatewayId')
+                vpc_id = att.get('VpcId')
+                subnet_ids = att.get('SubnetIds', [])
+                state = att.get('State')
+
+                # Ensure VPC <-> TGW relationship exists
+                if tgw_id and vpc_id:
+                    self.add_relationship(Relationship(
+                        source_id=vpc_id,
+                        target_id=tgw_id,
+                        relationship_type=RelationshipType.CONNECTS_TO,
+                        properties={'state': state}
+                    ))
+
+                # Add subnet-level relationships to TGW (for attachment grouping by AZ)
+                for subnet_id in subnet_ids:
+                    self.add_relationship(Relationship(
+                        source_id=subnet_id,
+                        target_id=tgw_id,
+                        relationship_type=RelationshipType.CONNECTS_TO,
+                        properties={'state': state}
+                    ))
+            logger.debug("Collected Transit Gateway VPC attachments and subnet relationships")
+        except Exception as e:
+            error_msg = f"Failed to collect Transit Gateway VPC Attachments: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
+
+    def _collect_vpc_peering_connections(self, ec2_client: Any) -> None:
+        """Collect VPC peering connections and create peer relationships."""
+        try:
+            response = self._make_api_call(ec2_client, 'describe_vpc_peering_connections')
+            if not response:
+                return
+            for pcx in response.get('VpcPeeringConnections', []):
+                pcx_id = pcx['VpcPeeringConnectionId']
+                name = None
+                tags = {}
+                for tag in pcx.get('Tags', []):
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+                    tags[tag['Key']] = tag['Value']
+                location = self.create_resource_location()
+                metadata = self.create_resource_metadata(tags=tags)
+                pcx_resource = BaseResource(
+                    resource_id=pcx_id,
+                    resource_type=ResourceType.VPC_PEERING,
+                    name=name,
+                    arn=f"arn:aws:ec2:{self.region}:{self.account_id}:vpc-peering-connection/{pcx_id}",
+                    location=location,
+                    metadata=metadata,
+                    properties={
+                        'status': pcx.get('Status', {}),
+                        'requester_vpc': pcx.get('RequesterVpcInfo', {}),
+                        'accepter_vpc': pcx.get('AccepterVpcInfo', {})
+                    }
+                )
+                self.add_resource(pcx_resource)
+
+                # Create peer relationship between the two VPCs
+                req_vpc = pcx.get('RequesterVpcInfo', {}).get('VpcId')
+                acc_vpc = pcx.get('AccepterVpcInfo', {}).get('VpcId')
+                if req_vpc and acc_vpc:
+                    self.add_relationship(Relationship(
+                        source_id=req_vpc,
+                        target_id=acc_vpc,
+                        relationship_type=RelationshipType.PEERS_WITH,
+                        properties={'status': pcx.get('Status', {})}
+                    ))
+                logger.debug(f"Collected VPC Peering Connection: {pcx_id}")
+        except Exception as e:
+            error_msg = f"Failed to collect VPC Peering Connections: {e}"
             logger.error(error_msg)
             self.collection_errors.append(error_msg)
