@@ -476,35 +476,7 @@ class AWSLabsTransformer:
                 logical_children = self._create_logical_subnet_groups(resource_id, resources)
                 vpc_children.extend(logical_children)
                 
-                # Add VPC endpoints as a single container arranged roughly square
-                vpc_endpoints = self._find_vpc_endpoints(resource_id)
-                if vpc_endpoints:
-                    if len(vpc_endpoints) == 1:
-                        vpc_children.extend(vpc_endpoints)
-                    else:
-                        n = len(vpc_endpoints)
-                        rows = max(1, int(math.ceil(math.sqrt(n))))
-                        cols = max(1, int(math.ceil(n / rows)))
-                        ep_row_ids: List[str] = []
-                        for i in range(rows):
-                            start = i * cols
-                            end = start + cols
-                            row_children = vpc_endpoints[start:end]
-                            if not row_children:
-                                continue
-                            row_id = f"{resource_id}-endpoints-row-{i+1}"
-                            ep_row_ids.append(row_id)
-                            resources[row_id] = {
-                                "Type": "AWS::Diagram::HorizontalStack",
-                                "Children": row_children
-                            }
-                        endpoint_stack_id = f"{resource_id}-vpc-endpoints"
-                        resources[endpoint_stack_id] = {
-                            "Type": "AWS::Diagram::VerticalStack",
-                            "Title": "VPC Endpoints",
-                            "Children": ep_row_ids
-                        }
-                        vpc_children.append(endpoint_stack_id)
+                # Do not render a separate VPC Endpoints container; endpoints are shown within logical subnets
                 
                 resources[resource_id] = {
                     "Type": "AWS::EC2::VPC",
@@ -728,6 +700,37 @@ class AWSLabsTransformer:
                 }
                 extra_row_ids.append(tgw_row_id)
 
+            # VPC Endpoints within this group's subnets -> add as service nodes (avoid VPC-level row)
+            vpce_nodes: List[str] = []
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type == ResourceType.VPC_ENDPOINT:
+                    ep_subnets = set(res2.properties.get('subnet_ids') or [])
+                    if not (ep_subnets & subnet_set):
+                        continue
+                    service_name = self._get_vpc_endpoint_service(res2)
+                    owner = (res2.properties.get('service_owner') or '').lower()
+                    # If AWS-owned, map to service icon; else use VPCE node with owner note
+                    node_id = f"{rid2}-in-{group_node_id}"
+                    if owner == 'amazon':
+                        mapped = self._vpce_service_icon(res2.properties.get('service_name') or '')
+                        if mapped:
+                            svc_type, svc_title = mapped
+                            resources[node_id] = {"Type": svc_type, "Title": f"{svc_title} (via VPC Endpoint)"}
+                        else:
+                            title = f"VPC Endpoint" + (f"\n({service_name})" if service_name else "")
+                            resources[node_id] = {"Type": "AWS::EC2::VPCEndpoint", "Title": title}
+                    else:
+                        title_lines = ["VPC Endpoint"]
+                        sid = self._get_vpce_service_id(res2.properties.get('service_name') or '')
+                        if service_name:
+                            title_lines.append(f"({service_name})")
+                        elif sid:
+                            title_lines.append(f"({sid})")
+                        if owner:
+                            title_lines.append(f"Owner: {owner}")
+                        resources[node_id] = {"Type": "AWS::EC2::VPCEndpoint", "Title": "\n".join(title_lines)}
+                    vpce_nodes.append(node_id)
+
             # Orphan ENIs (exclude VPCE and ENIs member_of ECS services and LB/Lambda ENIs)
             # Collect VPCE ENI IDs
             vpce_eni_ids: set = set()
@@ -767,10 +770,12 @@ class AWSLabsTransformer:
                     ):
                         continue
                     eni_ids.append(rid2)
-            if eni_ids:
-                eni_row_id = f"{group_node_id}-eni-row"
-                resources[eni_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": eni_ids}
-                extra_row_ids.append(eni_row_id)
+            # Combine VPCE and ENIs into a single auxiliary row (keeps service grid clean)
+            aux_nodes = vpce_nodes + eni_ids
+            if aux_nodes:
+                aux_row_id = f"{group_node_id}-aux-row"
+                resources[aux_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": aux_nodes}
+                extra_row_ids.append(aux_row_id)
 
             # Build a grid of service nodes: LB stacks plus standalone services
             service_nodes = lb_stack_ids[:]
@@ -827,11 +832,8 @@ class AWSLabsTransformer:
                 resource_def["IconFill"] = {"Type": "rect"}
                 
             elif resource.resource_type == ResourceType.VPC_ENDPOINT:
-                # Determine VPC endpoint service for better labeling
-                service_name = self._get_vpc_endpoint_service(resource)
-                if service_name:
-                    resource_def["Title"] = f"VPC Endpoint\n({service_name})"
-                    
+                # Skip top-level VPCE nodes; endpoints are rendered within logical subnets
+                continue
             elif resource.resource_type == ResourceType.NAT_GATEWAY:
                 # Keep default rendering; avoid unsupported preset names
                 pass
@@ -842,98 +844,14 @@ class AWSLabsTransformer:
             resources[resource_id] = resource_def
     
     def _create_links(self, resources: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Create links from topology relationships."""
-        links = []
+        """Create links for the diagram.
 
-        for relationship in self.view.filtered_relationships:
-            # Skip certain relationship types that are represented visually by layout
-            if (
-                relationship.relationship_type == RelationshipType.CONTAINS
-                or relationship.relationship_type == RelationshipType.ATTACHED_TO
-                or relationship.relationship_type == RelationshipType.ALLOWS
-                or relationship.relationship_type == RelationshipType.MEMBER_OF
-                or relationship.source_id not in self.view.filtered_resources
-                or relationship.target_id not in self.view.filtered_resources
-            ):
-                continue
+        Service-centric gating: only draw synthesized LB -> backend target links
+        to preserve the layout and avoid SG/membership link noise.
+        """
+        links: List[Dict[str, Any]] = []
 
-            # Remove TGW <-> Subnet links (attachments are displayed separately)
-            src_res = self.view.filtered_resources.get(relationship.source_id)
-            tgt_res = self.view.filtered_resources.get(relationship.target_id)
-
-            # Minimal hotfix: skip links involving ENIs to avoid unresolved node references
-            try:
-                if (
-                    (src_res and src_res.resource_type == ResourceType.NETWORK_INTERFACE)
-                    or (tgt_res and tgt_res.resource_type == ResourceType.NETWORK_INTERFACE)
-                ):
-                    continue
-            except Exception:
-                # Be defensive; if anything goes wrong determining type, skip this link
-                continue
-
-            if (
-                relationship.relationship_type == RelationshipType.CONNECTS_TO
-                and src_res
-                and tgt_res
-                and (
-                    (src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.SUBNET)
-                    or (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.SUBNET)
-                )
-            ):
-                continue
-
-            link = {
-                "Source": relationship.source_id,
-                "Target": relationship.target_id,
-                "Type": "orthogonal",
-                "SourcePosition": "N",
-                "TargetPosition": "S",
-            }
-
-            # Add label based on relationship type
-            if relationship.relationship_type == RelationshipType.ATTACHED_TO:
-                link["Labels"] = {"SourceLeft": {"Title": "attached"}}
-            elif relationship.relationship_type == RelationshipType.ROUTES_TO:
-                link["Labels"] = {"SourceLeft": {"Title": "routes"}}
-
-            # Special positioning for TGW<->VPC links: draw horizontally to VPC right side
-            if (
-                relationship.relationship_type == RelationshipType.CONNECTS_TO
-                and src_res
-                and tgt_res
-                and (
-                    (src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.VPC)
-                    or (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.VPC)
-                )
-            ):
-                if src_res.resource_type == ResourceType.TRANSIT_GATEWAY:
-                    link["SourcePosition"] = "W"
-                    link["TargetPosition"] = "E"
-                else:
-                    link["SourcePosition"] = "E"
-                    link["TargetPosition"] = "W"
-
-            # For primary VPC peering to a peer placed underneath, draw vertical link
-            if (
-                relationship.relationship_type == RelationshipType.PEERS_WITH
-                and src_res
-                and tgt_res
-                and src_res.resource_type == ResourceType.VPC
-                and tgt_res.resource_type == ResourceType.VPC
-                and self.primary_vpc_id is not None
-                and (src_res.resource_id == self.primary_vpc_id or tgt_res.resource_id == self.primary_vpc_id)
-            ):
-                if src_res.resource_id == self.primary_vpc_id:
-                    link["SourcePosition"] = "S"
-                    link["TargetPosition"] = "N"
-                else:
-                    link["SourcePosition"] = "N"
-                    link["TargetPosition"] = "S"
-
-            links.append(link)
-
-        # Synthesize LB -> backend links for service-centric view
+        # Synthesize LB -> backend links for service-centric view only
         seen = set()
         for lb_id, backend_id in sorted(self._lb_backend_links):
             if lb_id not in resources or backend_id not in resources:
@@ -950,7 +868,6 @@ class AWSLabsTransformer:
                 "TargetPosition": "N",
             }
             links.append(link)
-
         return links
     
     def _find_internet_gateway(self, vpc_id: str) -> Optional[str]:
@@ -1064,6 +981,46 @@ class AWSLabsTransformer:
             if len(parts) >= 3:
                 return parts[-1].upper()  # e.g., 'S3', 'ECR', 'SSM'
         return None
+
+    def _get_vpce_service_id(self, service_name: str) -> Optional[str]:
+        """Extract the vpce service id (vpce-svc-*) from a full service name."""
+        if not service_name:
+            return None
+        for token in service_name.split('.'):
+            if token.lower().startswith('vpce-svc-'):
+                return token.upper()
+        return None
+
+    def _vpce_service_icon(self, service_name: str) -> Optional[Tuple[str, str]]:
+        """Map a VPC endpoint AWS service name to a DAC service type and friendly title.
+
+        Returns (service_type, title). Example: ("AWS::ECR", "ECR").
+        """
+        if not service_name:
+            return None
+        s = service_name.lower()
+        tokens = s.split('.')
+        if 'ecr' in tokens:
+            return ("AWS::ECR", "ECR")
+        if 's3' in tokens:
+            return ("AWS::S3", "S3")
+        if 'kms' in tokens:
+            return ("AWS::KMS", "KMS")
+        if 'secretsmanager' in tokens:
+            return ("AWS::SecretsManager", "Secrets Manager")
+        if 'ssm' in tokens or 'ec2messages' in tokens or 'ssmmessages' in tokens:
+            # DAC often lacks Systems Manager; use EC2 icon as a neutral fallback
+            return ("AWS::EC2", "Systems Manager")
+        if 'logs' in tokens:
+            return ("AWS::CloudWatch", "CloudWatch Logs")
+        if 'monitoring' in tokens:
+            return ("AWS::CloudWatch", "CloudWatch")
+        if 'events' in tokens or 'eventbridge' in tokens:
+            return ("AWS::EventBridge", "EventBridge")
+        if 'elasticloadbalancing' in tokens:
+            return ("AWS::ElasticLoadBalancingV2::LoadBalancer", "Elastic Load Balancing")
+        # Fallback: show EC2 icon with last token
+        return ("AWS::EC2", tokens[-1].upper())
     
     def _get_subnet_logical_group(self, subnet: BaseResource) -> str:
         """Extract logical group name from subnet name."""
