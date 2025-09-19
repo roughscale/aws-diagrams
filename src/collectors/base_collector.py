@@ -54,7 +54,9 @@ class BaseCollector(ABC):
         account_id: str,
         region: str,
         rate_limit_delay: float = 0.1,
-        max_retries: int = 3
+        max_retries: int = 3,
+        vpc_ids: Optional[List[str]] = None,
+        allowed_subnet_ids: Optional[List[str]] = None
     ):
         """
         Initialize the collector.
@@ -76,6 +78,9 @@ class BaseCollector(ABC):
         self.discovered_relationships: List[Relationship] = []
         self.collection_errors: List[str] = []
         self.api_calls_made = 0
+        # Optional scoping for downstream collectors
+        self.vpc_ids: Optional[Set[str]] = set(vpc_ids) if vpc_ids else None
+        self.allowed_subnet_ids: Optional[Set[str]] = set(allowed_subnet_ids) if allowed_subnet_ids else None
         
         # Initialize clients dictionary for caching
         self._clients: Dict[str, Any] = {}

@@ -88,6 +88,11 @@ def collect(ctx):
     help='AWS regions to collect from (can be specified multiple times)'
 )
 @click.option(
+    '--vpc-ids',
+    multiple=True,
+    help='Limit collection to these VPC IDs (can be specified multiple times)'
+)
+@click.option(
     '--role-name',
     default=lambda: os.getenv('AWS_ORG_ROLE_NAME', 'OrganizationAccountAccessRole'),
     help='Cross-account role name to assume (empty to use current credentials)'
@@ -109,13 +114,19 @@ def collect(ctx):
     help='Overwrite existing topology file'
 )
 @click.option(
+    '--append',
+    is_flag=True,
+    help='Append/merge into an existing topology file instead of overwriting'
+)
+@click.option(
     '--direct-access',
     is_flag=True,
     help='Use current AWS credentials directly (no cross-account role assumption)'
 )
 @click.pass_context
 def collect_account(ctx, account_id: str, regions: tuple, role_name: str, 
-                   output: str, collectors: tuple, force: bool, direct_access: bool):
+                   output: str, collectors: tuple, force: bool, append: bool, direct_access: bool,
+                   vpc_ids: tuple):
     """Collect topology data from a single AWS account."""
     
     logger = ctx.obj['logger']
@@ -125,6 +136,19 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
     # Import here to avoid circular imports
     try:
         from ..collectors.vpc_collector import VPCCollector
+        # Optional collectors
+        try:
+            from ..collectors.ecs_collector import ECSCollector  # type: ignore
+        except Exception:
+            ECSCollector = None  # type: ignore
+        try:
+            from ..collectors.elbv2_collector import ELBV2Collector  # type: ignore
+        except Exception:
+            ELBV2Collector = None  # type: ignore
+        try:
+            from ..collectors.lambda_collector import LambdaCollector  # type: ignore
+        except Exception:
+            LambdaCollector = None  # type: ignore
         from ..auth import MultiAccountAuthenticator
         from ..topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         try:
@@ -133,6 +157,18 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from topology.serializer import TopologyYAMLSerializer
     except ImportError:
         from collectors.vpc_collector import VPCCollector
+        try:
+            from collectors.ecs_collector import ECSCollector  # type: ignore
+        except Exception:
+            ECSCollector = None  # type: ignore
+        try:
+            from collectors.elbv2_collector import ELBV2Collector  # type: ignore
+        except Exception:
+            ELBV2Collector = None  # type: ignore
+        try:
+            from collectors.lambda_collector import LambdaCollector  # type: ignore
+        except Exception:
+            LambdaCollector = None  # type: ignore
         from auth import MultiAccountAuthenticator
         from topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         from topology.serializer import TopologyYAMLSerializer
@@ -146,8 +182,8 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
     
     # Check if output file exists
     output_path = Path(output)
-    if output_path.exists() and not force:
-        logger.error(f"Output file {output} already exists. Use --force to overwrite.")
+    if output_path.exists() and not force and not append:
+        logger.error(f"Output file {output} already exists. Use --force to overwrite or --append to merge.")
         sys.exit(1)
     
     try:
@@ -232,6 +268,12 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             available_collectors = {
                 'vpc': VPCCollector
             }
+            if 'ECSCollector' in locals() and ECSCollector:
+                available_collectors['ecs'] = ECSCollector  # type: ignore
+            if 'ELBV2Collector' in locals() and ELBV2Collector:
+                available_collectors['elbv2'] = ELBV2Collector  # type: ignore
+            if 'LambdaCollector' in locals() and LambdaCollector:
+                available_collectors['lambda'] = LambdaCollector  # type: ignore
             
             if collectors:
                 selected_collectors = {
@@ -241,14 +283,24 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             else:
                 selected_collectors = available_collectors
             
-            # Run collectors
-            for collector_name, collector_class in selected_collectors.items():
+            # Run collectors. If VPC IDs provided, run VPC collector first to discover subnets,
+            # then pass the subnet set to other collectors for filtering.
+            ordered = list(selected_collectors.items())
+            if 'vpc' in selected_collectors:
+                ordered = [('vpc', selected_collectors['vpc'])] + [
+                    (k, v) for k, v in selected_collectors.items() if k != 'vpc'
+                ]
+            collected_subnet_ids: List[str] = []
+
+            for collector_name, collector_class in ordered:
                 logger.info(f"Running {collector_name} collector")
                 
                 collector = collector_class(
                     session=region_session,
                     account_id=account_id,
-                    region=region
+                    region=region,
+                    vpc_ids=list(vpc_ids) if vpc_ids else None,
+                    allowed_subnet_ids=collected_subnet_ids if collected_subnet_ids else None
                 )
                 
                 # Run collection
@@ -268,17 +320,61 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
                 
                 if results.get('collection_failed', False):
                     logger.warning(f"Collector {collector_name} failed: {results.get('failure_reason')}")
+
+                # After VPC collector, extract the targeted subnet IDs for downstream filtering
+                if collector_name == 'vpc' and vpc_ids:
+                    try:
+                        collected_subnet_ids = [
+                            r.resource_id for r in collector.collected_resources.values()
+                            if getattr(r, 'resource_type', None) and r.resource_type.value == 'subnet' and
+                            r.properties.get('vpc_id') in set(vpc_ids)
+                        ]
+                    except Exception:
+                        collected_subnet_ids = []
         
         # Update topology metadata
         topology.metadata.total_resources = total_resources
         topology.metadata.api_calls_made = total_api_calls
         topology.metadata.last_updated = datetime.now()
         
-        # Save topology
+        # Save or append topology
         serializer = TopologyYAMLSerializer()
-        serializer.save_to_file(topology, output_path)
-        
-        logger.info(f"Collection completed successfully. Saved to {output}")
+        if append and output_path.exists():
+            try:
+                existing = serializer.load_from_file(output_path)
+                # Merge account regions into existing topology
+                new_org = topology.organization
+                new_acct = new_org.accounts.get(account_id)
+                if not new_acct:
+                    logger.warning("No account data collected to append. Saving existing file unchanged.")
+                else:
+                    if account_id in existing.organization.accounts:
+                        existing_acct = existing.organization.accounts[account_id]
+                        # Merge/replace regions
+                        for region_name, region_data in new_acct.regions.items():
+                            existing_acct.regions[region_name] = region_data
+                        # Extend cross-region relationships
+                        existing_acct.cross_region_relationships.extend(new_acct.cross_region_relationships)
+                        existing_acct.last_updated = new_acct.last_updated
+                    else:
+                        # Add whole account if not present
+                        existing.organization.accounts[account_id] = new_acct
+                    # Merge cross-account relationships
+                    existing.organization.cross_account_relationships.extend(new_org.cross_account_relationships)
+                    # Recompute simple metadata counters
+                    existing.metadata.total_accounts = len(existing.organization.accounts)
+                    existing.metadata.total_regions = sum(len(a.regions) for a in existing.organization.accounts.values())
+                    existing.metadata.total_resources = sum(len(r.resources) for a in existing.organization.accounts.values() for r in a.regions.values())
+                # Save merged topology
+                serializer.save_to_file(existing, output_path)
+                logger.info(f"Collection completed successfully. Appended data to {output}")
+            except Exception as e:
+                logger.error(f"Failed to append to existing topology: {e}")
+                sys.exit(1)
+        else:
+            # Overwrite/save fresh topology
+            serializer.save_to_file(topology, output_path)
+            logger.info(f"Collection completed successfully. Saved to {output}")
         logger.info(f"Statistics: {total_resources} resources, {total_relationships} relationships, {total_api_calls} API calls")
         
     except Exception as e:

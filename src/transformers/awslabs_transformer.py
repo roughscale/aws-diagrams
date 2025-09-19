@@ -73,7 +73,8 @@ class AWSLabsTransformer:
         ResourceType.ECS_SERVICE: "AWS::ECS::Service",
         ResourceType.LAMBDA_FUNCTION: "AWS::Lambda::Function",
         ResourceType.TRANSIT_GATEWAY: "AWS::EC2::TransitGateway",
-        ResourceType.VPC_PEERING: "AWS::EC2::VPCPeeringConnection"
+        ResourceType.VPC_PEERING: "AWS::EC2::VPCPeeringConnection",
+        ResourceType.NETWORK_INTERFACE: "AWS::EC2::NetworkInterface"
     }
     
     # Icons for different resource types
@@ -95,6 +96,14 @@ class AWSLabsTransformer:
         self.connections: List[DiagramConnection] = []
         self.groups: Dict[str, List[str]] = {}
         self.primary_vpc_id: Optional[str] = self._extract_primary_vpc_id()
+        # Enable logical subnet grouping (Phase 1)
+        self.logical_subnets_enabled: bool = True
+        # Single-parent guards to avoid DAGs/cycles in DAC
+        self._group_parent: Dict[str, str] = {}       # resource_id -> logical subnet node id
+        self._tg_parent: Dict[str, str] = {}          # tg_id -> load_balancer_id
+        self._backend_parent: Dict[str, str] = {}     # backend_id -> target_group_id
+        # Explicit LB -> backend link intents for service-centric rendering
+        self._lb_backend_links: Set[Tuple[str, str]] = set()
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -124,6 +133,31 @@ class AWSLabsTransformer:
         for resource_id, resource in self.view.filtered_resources.items():
             node = self._create_node_from_resource(resource)
             self.nodes[resource_id] = node
+
+    def _grid_stack(self, resources_map: Dict[str, Any], base_id: str, child_ids: List[str]) -> List[str]:
+        """Create a near-square grid of children using HorizontalStack rows.
+
+        Returns a list of row node IDs that can be added as Children of a container.
+        """
+        if not child_ids:
+            return []
+        n = len(child_ids)
+        rows = max(1, int(math.ceil(math.sqrt(n))))
+        cols = max(1, int(math.ceil(n / rows)))
+        row_ids: List[str] = []
+        for i in range(rows):
+            start = i * cols
+            end = start + cols
+            row_children = child_ids[start:end]
+            if not row_children:
+                continue
+            row_id = f"{base_id}-grid-row-{i+1}"
+            resources_map[row_id] = {
+                "Type": "AWS::Diagram::HorizontalStack",
+                "Children": row_children,
+            }
+            row_ids.append(row_id)
+        return row_ids
     
     def _create_node_from_resource(self, resource: BaseResource) -> DiagramNode:
         """Create a diagram node from a topology resource."""
@@ -389,14 +423,14 @@ class AWSLabsTransformer:
         # Add VPC resources
         self._add_vpc_resources(resources)
         
-        # Add AZ stacks 
-        self._add_az_stacks(resources)
+        # Phase 1: Use logical subnets rather than per-AZ subnet stacks
+        # self._add_az_stacks(resources)
         
         # Add other AWS resources (but skip individual subnets as they're now grouped)
         self._add_aws_resources(resources)
         
-        # Create links from relationships
-        links = self._create_links()
+        # Create links from relationships and synthesized intents
+        links = self._create_links(resources)
         
         diagram = {
             "Diagram": {
@@ -438,9 +472,9 @@ class AWSLabsTransformer:
                     })
 
                 
-                # Create availability zone stacks
-                az_stacks = self._create_az_stacks(resource_id)
-                vpc_children.extend(az_stacks)
+                # Phase 1: Create logical subnet groups per VPC
+                logical_children = self._create_logical_subnet_groups(resource_id, resources)
+                vpc_children.extend(logical_children)
                 
                 # Add VPC endpoints as a single container arranged roughly square
                 vpc_endpoints = self._find_vpc_endpoints(resource_id)
@@ -495,9 +529,268 @@ class AWSLabsTransformer:
                             "Children": [resource_id] + peer_vpcs
                         }
                         # Replace the VPC with panel in top-level VPCs stack
-                        if "VPCsStack" in resources:
-                            children = resources["VPCsStack"].get("Children", [])
-                            resources["VPCsStack"]["Children"] = [panel_id if c == resource_id else c for c in children]
+                    if "VPCsStack" in resources:
+                        children = resources["VPCsStack"].get("Children", [])
+                        resources["VPCsStack"]["Children"] = [panel_id if c == resource_id else c for c in children]
+
+    def _create_logical_subnet_groups(self, vpc_id: str, resources: Dict[str, Any]) -> List[str]:
+        """Synthesize logical Subnet nodes that aggregate subnets across AZs.
+
+        Phase 1: Only place ECS services and Lambda functions under these nodes.
+        """
+        if not self.logical_subnets_enabled:
+            return []
+
+        # Map group_name -> list of subnet ids in this VPC
+        group_to_subnets: Dict[str, List[str]] = {}
+        for rid, res in self.view.filtered_resources.items():
+            if res.resource_type == ResourceType.SUBNET and res.properties.get('vpc_id') == vpc_id:
+                group = self._get_subnet_logical_group(res)
+                group_to_subnets.setdefault(group, []).append(rid)
+
+        additions: List[str] = []
+        # Precompute Lambda targets from all TGs to avoid multi-parenting
+        tg_lambda_target_ids: set = set()
+        for rid_tg, res_tg in self.view.filtered_resources.items():
+            if res_tg.resource_type == ResourceType.TARGET_GROUP and (res_tg.properties or {}).get('target_type') == 'lambda':
+                for t in res_tg.properties.get('targets') or []:
+                    if t.get('id'):
+                        tg_lambda_target_ids.add(str(t['id']))
+
+        for group_name in sorted(group_to_subnets.keys()):
+            subnet_ids = group_to_subnets[group_name]
+            group_node_id = f"{vpc_id}-{group_name}-logical-subnet"
+            # Determine preset: public vs private
+            preset = "PublicSubnet" if "public" in group_name.lower() else "PrivateSubnet"
+
+            # Children (standalone services not in TGs)
+            svc_children: List[str] = []
+            # Load balancers detected in this group
+            lb_children: List[str] = []
+            subnet_set = set(subnet_ids)
+
+            for rid, res in self.view.filtered_resources.items():
+                if res.resource_type == ResourceType.ECS_SERVICE:
+                    subnets = set(res.properties.get('subnet_ids') or [])
+                    # If service is behind TGs, let TG own it to avoid multi-parent
+                    has_tgs = bool(res.properties.get('target_group_arns'))
+                    if subnets & subnet_set and not has_tgs:
+                        # Assign service to a single logical group
+                        parent = self._group_parent.get(rid)
+                        if parent is None:
+                            self._group_parent[rid] = group_node_id
+                            svc_children.append(rid)
+                elif res.resource_type == ResourceType.LAMBDA_FUNCTION:
+                    subnets = set(res.properties.get('subnet_ids') or [])
+                    # If lambda is a TG target, let TG own it to avoid multi-parent
+                    if subnets & subnet_set and res.resource_id not in tg_lambda_target_ids:
+                        parent = self._group_parent.get(rid)
+                        if parent is None:
+                            self._group_parent[rid] = group_node_id
+                            svc_children.append(rid)
+                elif res.resource_type == ResourceType.LOAD_BALANCER:
+                    lb_subnets = set(res.properties.get('subnet_ids') or [])
+                    if lb_subnets & subnet_set:
+                        parent = self._group_parent.get(rid)
+                        if parent is None:
+                            self._group_parent[rid] = group_node_id
+                            lb_children.append(rid)
+
+            # Build per-LB stacks with TG stacks inside (code_unstable pattern)
+            lb_stack_ids: List[str] = []
+            lb_set = set(lb_children)
+            # map LB -> TGs (by relationship LB CONTAINS TG)
+            lb_to_tgs: Dict[str, List[str]] = {lb: [] for lb in lb_children}
+            for rel in self.view.filtered_relationships:
+                if rel.relationship_type != RelationshipType.CONTAINS:
+                    continue
+                if rel.source_id in lb_set:
+                    tgt = self.view.filtered_resources.get(rel.target_id)
+                    if tgt and tgt.resource_type == ResourceType.TARGET_GROUP:
+                        if rel.target_id not in self._tg_parent:
+                            self._tg_parent[rel.target_id] = rel.source_id
+                            lb_to_tgs[rel.source_id].append(rel.target_id)
+
+            group_key = group_node_id
+            for lb_id in lb_children:
+                lb_res = self.view.filtered_resources.get(lb_id)
+                lb_title = (lb_res.name if lb_res else None) or lb_id
+                lb_icon_id = f"lb-icon-{lb_id}-in-{group_key}"
+                if lb_icon_id not in resources:
+                    resources[lb_icon_id] = {
+                        "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                        "Title": lb_title,
+                    }
+                tg_children_nodes: List[str] = []
+                for tg_id in lb_to_tgs.get(lb_id, []):
+                    tg = self.view.filtered_resources.get(tg_id)
+                    if not tg:
+                        continue
+                    svc_grand_children: List[str] = []
+                    # ECS backends
+                    for svc_id, svc in self.view.filtered_resources.items():
+                        if svc.resource_type == ResourceType.ECS_SERVICE:
+                            tgs = set(svc.properties.get('target_group_arns') or [])
+                            if tg_id in tgs:
+                                child_id = f"ecs-{svc_id}-in-{group_key}"
+                                if child_id not in resources:
+                                    resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
+                                svc_grand_children.append(child_id)
+                                self._lb_backend_links.add((lb_icon_id, child_id))
+                    # Lambda/EC2/IP backends
+                    for t in tg.properties.get('targets') or []:
+                        tid = t.get('id')
+                        if not tid:
+                            continue
+                        if str(tid).startswith('arn:aws:lambda:'):
+                            child_id = f"lambda-{tid}-in-{group_key}"
+                            lf = self.view.filtered_resources.get(tid)
+                            if child_id not in resources:
+                                resources[child_id] = {"Type": "AWS::Lambda::Function", "Title": (lf.name if lf else None) or tid}
+                            svc_grand_children.append(child_id)
+                            self._lb_backend_links.add((lb_icon_id, child_id))
+                        elif str(tid).startswith('i-'):
+                            child_id = f"ec2-{tid}-in-{group_key}"
+                            if child_id not in resources:
+                                resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": tid}
+                            svc_grand_children.append(child_id)
+                            self._lb_backend_links.add((lb_icon_id, child_id))
+                        elif '.' in str(tid):
+                            ip = str(tid)
+                            port = t.get('port')
+                            child_id = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
+                            if child_id not in resources:
+                                title = f"IP {ip}{(':'+str(port)) if port else ''}"
+                                resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": title}
+                            svc_grand_children.append(child_id)
+                            self._lb_backend_links.add((lb_icon_id, child_id))
+                    # Build TG stack vertical with row
+                    tg_node_id = f"tg-{tg_id}-under-{lb_icon_id}"
+                    targets_row_id = f"{tg_node_id}-targets-row"
+                    resources[targets_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": svc_grand_children or []}
+                    resources[tg_node_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": f"TG: {(tg.name or 'Target Group')}", "Children": [targets_row_id]}
+                    tg_children_nodes.append(tg_node_id)
+                # Build LB stack
+                lb_stack_id = f"lb-{lb_id}-box-in-{group_key}"
+                lb_children_nodes = [lb_icon_id]
+                if tg_children_nodes:
+                    tg_row_id = f"{lb_stack_id}-tg-row"
+                    resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_children_nodes}
+                    lb_children_nodes.append(tg_row_id)
+                resources[lb_stack_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": lb_title, "Children": lb_children_nodes}
+                lb_stack_ids.append(lb_stack_id)
+
+            # Phase 2+: Add rows for NAT Gateways, TGW attachments, and orphan ENIs
+            extra_row_ids: List[str] = []
+
+            # NAT Gateways row
+            nat_ids: List[str] = []
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type == ResourceType.NAT_GATEWAY and res2.properties.get('subnet_id') in subnet_set:
+                    nat_ids.append(rid2)
+            if nat_ids:
+                nat_row_id = f"{group_node_id}-nat-row"
+                resources[nat_row_id] = {
+                    "Type": "AWS::Diagram::HorizontalStack",
+                    "Children": nat_ids,
+                }
+                extra_row_ids.append(nat_row_id)
+
+            # TGW attachment row (synthetic nodes for subnet<->TGW attachments)
+            tgw_attach_ids: List[str] = []
+            for rel in self.view.filtered_relationships:
+                if rel.relationship_type != RelationshipType.CONNECTS_TO:
+                    continue
+                src = self.view.filtered_resources.get(rel.source_id)
+                tgt = self.view.filtered_resources.get(rel.target_id)
+                if not src or not tgt:
+                    continue
+                if (
+                    (src.resource_type == ResourceType.SUBNET and src.resource_id in subnet_set and tgt.resource_type == ResourceType.TRANSIT_GATEWAY)
+                    or (tgt.resource_type == ResourceType.SUBNET and tgt.resource_id in subnet_set and src.resource_type == ResourceType.TRANSIT_GATEWAY)
+                ):
+                    subnet_id = src.resource_id if src.resource_type == ResourceType.SUBNET else tgt.resource_id
+                    tgw_id = tgt.resource_id if tgt.resource_type == ResourceType.TRANSIT_GATEWAY else src.resource_id
+                    attach_id = f"{subnet_id}-to-{tgw_id}-tgw-attach"
+                    if attach_id not in resources:
+                        az = None
+                        sub_res = self.view.filtered_resources.get(subnet_id)
+                        if sub_res and sub_res.location and sub_res.location.availability_zone:
+                            az = sub_res.location.availability_zone
+                        title = f"TGW Attachment" + (f" ({az})" if az else "")
+                        resources[attach_id] = {"Type": "AWS::EC2::TransitGateway", "Title": title}
+                    tgw_attach_ids.append(attach_id)
+            if tgw_attach_ids:
+                tgw_row_id = f"{group_node_id}-tgw-attach-row"
+                resources[tgw_row_id] = {
+                    "Type": "AWS::Diagram::HorizontalStack",
+                    "Children": list(dict.fromkeys(tgw_attach_ids)),
+                }
+                extra_row_ids.append(tgw_row_id)
+
+            # Orphan ENIs (exclude VPCE and ENIs member_of ECS services and LB/Lambda ENIs)
+            # Collect VPCE ENI IDs
+            vpce_eni_ids: set = set()
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type == ResourceType.VPC_ENDPOINT:
+                    for eni_id in res2.properties.get('network_interface_ids', []) or []:
+                        vpce_eni_ids.add(eni_id)
+            # Collect ENIs that are MEMBER_OF ECS services
+            member_eni_ids: set = set()
+            for rel in self.view.filtered_relationships:
+                if rel.relationship_type == RelationshipType.MEMBER_OF:
+                    src = self.view.filtered_resources.get(rel.source_id)
+                    tgt = self.view.filtered_resources.get(rel.target_id)
+                    if src and src.resource_type == ResourceType.NETWORK_INTERFACE and tgt and tgt.resource_type == ResourceType.ECS_SERVICE:
+                        member_eni_ids.add(src.resource_id)
+            # Collect LB SGs in this group
+            lb_sg_ids: set = set()
+            for lb_id in lb_children:
+                lb_res = self.view.filtered_resources.get(lb_id)
+                if not lb_res:
+                    continue
+                for sg in lb_res.properties.get('security_group_ids', []) or []:
+                    lb_sg_ids.add(sg)
+
+            eni_ids: List[str] = []
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type == ResourceType.NETWORK_INTERFACE and res2.properties.get('subnet_id') in subnet_set:
+                    desc = (res2.properties.get('description') or '').lower()
+                    sgs = set(res2.properties.get('security_group_ids') or [])
+                    # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned (ELB in desc or SG overlap), Lambda ENIs
+                    if (
+                        res2.resource_id in vpce_eni_ids or
+                        res2.resource_id in member_eni_ids or
+                        'elb' in desc or 'elastic load balancer' in desc or
+                        'lambda' in desc or
+                        (lb_sg_ids and (sgs & lb_sg_ids))
+                    ):
+                        continue
+                    eni_ids.append(rid2)
+            if eni_ids:
+                eni_row_id = f"{group_node_id}-eni-row"
+                resources[eni_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": eni_ids}
+                extra_row_ids.append(eni_row_id)
+
+            # Build a grid of service nodes: LB stacks plus standalone services
+            service_nodes = lb_stack_ids[:]
+            # Append standalone services (not rendered under TGs)
+            for rid in svc_children:
+                service_nodes.append(rid)
+            svc_ids = service_nodes
+            grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", svc_ids)
+            # Optionally add ENI/NAT/TGW rows
+            rows = grid_rows or svc_ids
+            rows.extend(extra_row_ids)
+            resources[group_node_id] = {
+                "Type": "AWS::EC2::Subnet",
+                "Title": group_name.replace('-', ' ').title(),
+                "Preset": preset,
+                "Children": rows,
+            }
+            additions.append(group_node_id)
+
+        return additions
     
     def _add_aws_resources(self, resources: Dict[str, Any]) -> None:
         """Add AWS resources to the diagram."""
@@ -517,22 +810,17 @@ class AWSLabsTransformer:
             
             # Add specific configurations for different resource types
             if resource.resource_type == ResourceType.SUBNET:
-                subnet_type = self._determine_subnet_type(resource)
-                if subnet_type == 'public':
-                    resource_def["Preset"] = "PublicSubnet"
-                else:
-                    resource_def["Preset"] = "PrivateSubnet"
-                    
-                # Find resources in this subnet
-                subnet_children = []
-                for child_id, child in self.view.filtered_resources.items():
-                    if child.properties.get('subnet_id') == resource_id:
-                        # Only attach EC2 instances here. NAT Gateways are grouped
-                        # at the logical subnet group level to avoid cycles.
-                        if child.resource_type in [ResourceType.EC2_INSTANCE]:
-                            subnet_children.append(child_id)
-                if subnet_children:
-                    resource_def["Children"] = subnet_children
+                # Skip rendering individual subnets when logical subnet grouping is enabled
+                if self.logical_subnets_enabled:
+                    continue
+
+            elif resource.resource_type == ResourceType.LOAD_BALANCER:
+                # Skip standalone LB node; rendered via per-LB stacks in logical subnets
+                continue
+
+            elif resource.resource_type == ResourceType.TARGET_GROUP:
+                # Do not render TGs as standalone nodes in service-centric layout
+                continue
                     
             elif resource.resource_type == ResourceType.INTERNET_GATEWAY:
                 # Internet Gateway styling
@@ -553,24 +841,46 @@ class AWSLabsTransformer:
             
             resources[resource_id] = resource_def
     
-    def _create_links(self) -> List[Dict[str, Any]]:
+    def _create_links(self, resources: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Create links from topology relationships."""
         links = []
-        
+
         for relationship in self.view.filtered_relationships:
             # Skip certain relationship types that are represented visually by layout
-            if (relationship.relationship_type == RelationshipType.CONTAINS or
-                relationship.relationship_type == RelationshipType.ATTACHED_TO or
-                relationship.source_id not in self.view.filtered_resources or
-                relationship.target_id not in self.view.filtered_resources):
+            if (
+                relationship.relationship_type == RelationshipType.CONTAINS
+                or relationship.relationship_type == RelationshipType.ATTACHED_TO
+                or relationship.relationship_type == RelationshipType.ALLOWS
+                or relationship.relationship_type == RelationshipType.MEMBER_OF
+                or relationship.source_id not in self.view.filtered_resources
+                or relationship.target_id not in self.view.filtered_resources
+            ):
                 continue
 
             # Remove TGW <-> Subnet links (attachments are displayed separately)
             src_res = self.view.filtered_resources.get(relationship.source_id)
             tgt_res = self.view.filtered_resources.get(relationship.target_id)
-            if (relationship.relationship_type == RelationshipType.CONNECTS_TO and src_res and tgt_res and
-                ((src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.SUBNET) or
-                 (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.SUBNET))):
+
+            # Minimal hotfix: skip links involving ENIs to avoid unresolved node references
+            try:
+                if (
+                    (src_res and src_res.resource_type == ResourceType.NETWORK_INTERFACE)
+                    or (tgt_res and tgt_res.resource_type == ResourceType.NETWORK_INTERFACE)
+                ):
+                    continue
+            except Exception:
+                # Be defensive; if anything goes wrong determining type, skip this link
+                continue
+
+            if (
+                relationship.relationship_type == RelationshipType.CONNECTS_TO
+                and src_res
+                and tgt_res
+                and (
+                    (src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.SUBNET)
+                    or (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.SUBNET)
+                )
+            ):
                 continue
 
             link = {
@@ -578,23 +888,25 @@ class AWSLabsTransformer:
                 "Target": relationship.target_id,
                 "Type": "orthogonal",
                 "SourcePosition": "N",
-                "TargetPosition": "S"
+                "TargetPosition": "S",
             }
 
             # Add label based on relationship type
             if relationship.relationship_type == RelationshipType.ATTACHED_TO:
-                link["Labels"] = {
-                    "SourceLeft": {"Title": "attached"}
-                }
+                link["Labels"] = {"SourceLeft": {"Title": "attached"}}
             elif relationship.relationship_type == RelationshipType.ROUTES_TO:
-                link["Labels"] = {
-                    "SourceLeft": {"Title": "routes"}
-                }
+                link["Labels"] = {"SourceLeft": {"Title": "routes"}}
 
             # Special positioning for TGW<->VPC links: draw horizontally to VPC right side
-            if (relationship.relationship_type == RelationshipType.CONNECTS_TO and src_res and tgt_res and
-                ((src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.VPC) or
-                 (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.VPC))):
+            if (
+                relationship.relationship_type == RelationshipType.CONNECTS_TO
+                and src_res
+                and tgt_res
+                and (
+                    (src_res.resource_type == ResourceType.TRANSIT_GATEWAY and tgt_res.resource_type == ResourceType.VPC)
+                    or (tgt_res.resource_type == ResourceType.TRANSIT_GATEWAY and src_res.resource_type == ResourceType.VPC)
+                )
+            ):
                 if src_res.resource_type == ResourceType.TRANSIT_GATEWAY:
                     link["SourcePosition"] = "W"
                     link["TargetPosition"] = "E"
@@ -603,10 +915,15 @@ class AWSLabsTransformer:
                     link["TargetPosition"] = "W"
 
             # For primary VPC peering to a peer placed underneath, draw vertical link
-            if (relationship.relationship_type == RelationshipType.PEERS_WITH and src_res and tgt_res and
-                src_res.resource_type == ResourceType.VPC and tgt_res.resource_type == ResourceType.VPC and
-                self.primary_vpc_id is not None and
-                (src_res.resource_id == self.primary_vpc_id or tgt_res.resource_id == self.primary_vpc_id)):
+            if (
+                relationship.relationship_type == RelationshipType.PEERS_WITH
+                and src_res
+                and tgt_res
+                and src_res.resource_type == ResourceType.VPC
+                and tgt_res.resource_type == ResourceType.VPC
+                and self.primary_vpc_id is not None
+                and (src_res.resource_id == self.primary_vpc_id or tgt_res.resource_id == self.primary_vpc_id)
+            ):
                 if src_res.resource_id == self.primary_vpc_id:
                     link["SourcePosition"] = "S"
                     link["TargetPosition"] = "N"
@@ -614,6 +931,24 @@ class AWSLabsTransformer:
                     link["SourcePosition"] = "N"
                     link["TargetPosition"] = "S"
 
+            links.append(link)
+
+        # Synthesize LB -> backend links for service-centric view
+        seen = set()
+        for lb_id, backend_id in sorted(self._lb_backend_links):
+            if lb_id not in resources or backend_id not in resources:
+                continue
+            key = (lb_id, backend_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            link = {
+                "Source": lb_id,
+                "Target": backend_id,
+                "Type": "orthogonal",
+                "SourcePosition": "S",
+                "TargetPosition": "N",
+            }
             links.append(link)
 
         return links

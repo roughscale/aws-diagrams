@@ -40,7 +40,8 @@ class VPCCollector(BaseCollector):
             ResourceType.NAT_GATEWAY,
             ResourceType.VPC_ENDPOINT,
             ResourceType.TRANSIT_GATEWAY,
-            ResourceType.VPC_PEERING
+            ResourceType.VPC_PEERING,
+            ResourceType.NETWORK_INTERFACE
         }
     
     @property
@@ -55,10 +56,12 @@ class VPCCollector(BaseCollector):
             'ec2:DescribeInternetGateways',
             'ec2:DescribeNatGateways',
             'ec2:DescribeVpcEndpoints',
+            'ec2:DescribeVpcEndpointServices',
             'ec2:DescribeVpcPeeringConnections',
             'ec2:DescribeTransitGateways',
             'ec2:DescribeTransitGatewayAttachments',
-            'ec2:DescribeTransitGatewayVpcAttachments'
+            'ec2:DescribeTransitGatewayVpcAttachments',
+            'ec2:DescribeNetworkInterfaces'
         ]
     
     def collect_resources(self) -> None:
@@ -80,11 +83,79 @@ class VPCCollector(BaseCollector):
         self._collect_transit_gateway_attachments(ec2)
         self._collect_transit_gateway_vpc_attachments(ec2)
         self._collect_vpc_peering_connections(ec2)
+        self._collect_network_interfaces(ec2)
+
+    def _collect_network_interfaces(self, ec2_client: Any) -> None:
+        """Collect Elastic Network Interfaces (ENIs) and attach to subnets/VPCs."""
+        try:
+            paginator = ec2_client.get_paginator('describe_network_interfaces')
+            paginate_kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                paginate_kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            for page in paginator.paginate(**paginate_kwargs):
+                for ni in page.get('NetworkInterfaces', []):
+                    eni_id = ni['NetworkInterfaceId']
+                    subnet_id = ni.get('SubnetId')
+                    vpc_id = ni.get('VpcId')
+                    interface_type = ni.get('InterfaceType')
+                    status = ni.get('Status')
+                    private_ip = ni.get('PrivateIpAddress')
+                    description = ni.get('Description')
+                    groups = [g.get('GroupId') for g in ni.get('Groups', [])]
+                    attachment = ni.get('Attachment', {})
+                    association = ni.get('Association', {})
+
+                    tags = {}
+                    tags_list = ni.get('TagSet', []) or ni.get('Tags', []) or []
+                    name = None
+                    for tag in tags_list:
+                        if tag.get('Key') == 'Name':
+                            name = tag.get('Value')
+                        tags[tag.get('Key')] = tag.get('Value')
+
+                    location = self.create_resource_location()
+                    metadata = self.create_resource_metadata(tags=tags)
+
+                    eni_resource = BaseResource(
+                        resource_id=eni_id,
+                        resource_type=ResourceType.NETWORK_INTERFACE,
+                        name=name or description,
+                        arn=f"arn:aws:ec2:{self.region}:{self.account_id}:network-interface/{eni_id}",
+                        location=location,
+                        metadata=metadata,
+                        properties={
+                            'subnet_id': subnet_id,
+                            'vpc_id': vpc_id,
+                            'interface_type': interface_type,
+                            'status': status,
+                            'description': description,
+                            'private_ip': private_ip,
+                            'security_group_ids': groups,
+                            'attachment': attachment,
+                            'association': association
+                        }
+                    )
+
+                    self.add_resource(eni_resource)
+
+                    if subnet_id:
+                        self.add_relationship(Relationship(
+                            source_id=subnet_id,
+                            target_id=eni_id,
+                            relationship_type=RelationshipType.CONTAINS
+                        ))
+        except Exception as e:
+            error_msg = f"Failed to collect Network Interfaces: {e}"
+            logger.error(error_msg)
+            self.collection_errors.append(error_msg)
     
     def _collect_vpcs(self, ec2_client: Any) -> None:
         """Collect VPC resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_vpcs')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['VpcIds'] = list(self.vpc_ids)
+            response = self._make_api_call(ec2_client, 'describe_vpcs', **kwargs)
             if not response:
                 return
             
@@ -136,7 +207,10 @@ class VPCCollector(BaseCollector):
     def _collect_subnets(self, ec2_client: Any) -> None:
         """Collect subnet resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_subnets')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_subnets', **kwargs)
             if not response:
                 return
             
@@ -197,7 +271,10 @@ class VPCCollector(BaseCollector):
     def _collect_security_groups(self, ec2_client: Any) -> None:
         """Collect security group resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_security_groups')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_security_groups', **kwargs)
             if not response:
                 return
             
@@ -253,7 +330,10 @@ class VPCCollector(BaseCollector):
     def _collect_network_acls(self, ec2_client: Any) -> None:
         """Collect Network ACL resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_network_acls')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_network_acls', **kwargs)
             if not response:
                 return
             
@@ -308,7 +388,10 @@ class VPCCollector(BaseCollector):
     def _collect_route_tables(self, ec2_client: Any) -> None:
         """Collect route table resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_route_tables')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_route_tables', **kwargs)
             if not response:
                 return
             
@@ -363,7 +446,10 @@ class VPCCollector(BaseCollector):
     def _collect_internet_gateways(self, ec2_client: Any) -> None:
         """Collect Internet Gateway resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_internet_gateways')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'attachment.vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_internet_gateways', **kwargs)
             if not response:
                 return
             
@@ -418,7 +504,11 @@ class VPCCollector(BaseCollector):
     def _collect_nat_gateways(self, ec2_client: Any) -> None:
         """Collect NAT Gateway resources."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_nat_gateways')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                # EC2 DescribeNatGateways uses 'Filter' (singular) parameter
+                kwargs['Filter'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_nat_gateways', **kwargs)
             if not response:
                 return
             
@@ -475,15 +565,39 @@ class VPCCollector(BaseCollector):
             self.collection_errors.append(error_msg)
     
     def _collect_vpc_endpoints(self, ec2_client: Any) -> None:
-        """Collect VPC Endpoint resources."""
+        """Collect VPC Endpoint resources and enrich with service owner."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_vpc_endpoints')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_vpc_endpoints', **kwargs)
             if not response:
                 return
-            
-            for endpoint_data in response.get('VpcEndpoints', []):
+
+            endpoints = response.get('VpcEndpoints', [])
+            service_names = sorted({ep.get('ServiceName') for ep in endpoints if ep.get('ServiceName')})
+
+            owners_by_service: Dict[str, str] = {}
+            try:
+                if service_names:
+                    svc_resp = self._make_api_call(
+                        ec2_client,
+                        'describe_vpc_endpoint_services',
+                        ServiceNames=service_names
+                    )
+                    details = svc_resp.get('ServiceDetails') or []
+                    for d in details:
+                        name = d.get('ServiceName')
+                        owner = d.get('Owner')
+                        if name and owner:
+                            owners_by_service[name] = owner
+            except Exception as e:
+                logger.debug(f"Could not resolve endpoint service owners: {e}")
+
+            for endpoint_data in endpoints:
                 endpoint_id = endpoint_data['VpcEndpointId']
                 vpc_id = endpoint_data['VpcId']
+                service_name = endpoint_data.get('ServiceName')
                 
                 # Extract name from tags
                 name = None
@@ -506,11 +620,13 @@ class VPCCollector(BaseCollector):
                     metadata=metadata,
                     properties={
                         'vpc_id': vpc_id,
-                        'service_name': endpoint_data.get('ServiceName'),
+                        'service_name': service_name,
+                        'service_owner': owners_by_service.get(service_name),
                         'vpc_endpoint_type': endpoint_data.get('VpcEndpointType'),
                         'state': endpoint_data.get('State'),
                         'route_table_ids': endpoint_data.get('RouteTableIds', []),
                         'subnet_ids': endpoint_data.get('SubnetIds', []),
+                        'network_interface_ids': endpoint_data.get('NetworkInterfaceIds', []),
                         'security_group_ids': endpoint_data.get('Groups', []),
                         'dns_entries': endpoint_data.get('DnsEntries', [])
                     }
@@ -536,6 +652,7 @@ class VPCCollector(BaseCollector):
     def _collect_transit_gateways(self, ec2_client: Any) -> None:
         """Collect Transit Gateway resources."""
         try:
+            # No vpc-id filter for TGWs; collect minimal data. Attachments will be filtered by VPC.
             response = self._make_api_call(ec2_client, 'describe_transit_gateways')
             if not response:
                 return
@@ -572,7 +689,13 @@ class VPCCollector(BaseCollector):
     def _collect_transit_gateway_attachments(self, ec2_client: Any) -> None:
         """Collect Transit Gateway Attachments and create relationships to subnets/VPCs."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_transit_gateway_attachments')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [
+                    {'Name': 'resource-type', 'Values': ['vpc']},
+                    {'Name': 'resource-id', 'Values': list(self.vpc_ids)}
+                ]
+            response = self._make_api_call(ec2_client, 'describe_transit_gateway_attachments', **kwargs)
             if not response:
                 return
             for att in response.get('TransitGatewayAttachments', []):
@@ -614,7 +737,10 @@ class VPCCollector(BaseCollector):
     def _collect_transit_gateway_vpc_attachments(self, ec2_client: Any) -> None:
         """Collect Transit Gateway VPC Attachments to get per-AZ SubnetIds and link them to TGW."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_transit_gateway_vpc_attachments')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [{'Name': 'vpc-id', 'Values': list(self.vpc_ids)}]
+            response = self._make_api_call(ec2_client, 'describe_transit_gateway_vpc_attachments', **kwargs)
             if not response:
                 return
             for att in response.get('TransitGatewayVpcAttachments', []):
@@ -649,7 +775,13 @@ class VPCCollector(BaseCollector):
     def _collect_vpc_peering_connections(self, ec2_client: Any) -> None:
         """Collect VPC peering connections and create peer relationships."""
         try:
-            response = self._make_api_call(ec2_client, 'describe_vpc_peering_connections')
+            kwargs: Dict[str, Any] = {}
+            if getattr(self, 'vpc_ids', None):
+                kwargs['Filters'] = [
+                    {'Name': 'requester-vpc-info.vpc-id', 'Values': list(self.vpc_ids)},
+                    {'Name': 'accepter-vpc-info.vpc-id', 'Values': list(self.vpc_ids)}
+                ]
+            response = self._make_api_call(ec2_client, 'describe_vpc_peering_connections', **kwargs)
             if not response:
                 return
             for pcx in response.get('VpcPeeringConnections', []):

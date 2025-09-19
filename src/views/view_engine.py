@@ -319,30 +319,75 @@ class ViewEngine:
         account_id: Optional[str] = None,
         region: Optional[str] = None
     ) -> TopologyView:
-        """Create a view focused on a single VPC and its resources."""
-        # Get all resources first
+        """Create a view focused on a single VPC and its resources.
+
+        This implementation avoids cross-account ID collisions by first
+        locating the canonical VPC resource (and its owning account), then
+        collecting VPC membership resources only from that account. External
+        nodes (TGW, peered VPCs) are added explicitly regardless of account.
+        """
+
+        # Get a full map of resources for cross-account lookups (e.g., peers/PCX)
         all_resources = self._get_all_resources()
-        
-        # Find VPC-related resources
-        vpc_resources = {}
-        
-        # Add the VPC itself
-        if vpc_id in all_resources:
-            vpc_resources[vpc_id] = all_resources[vpc_id]
-        
-        # Add resources that belong to the VPC (have vpc_id property)
-        for resource_id, resource in all_resources.items():
-            if resource.properties.get('vpc_id') == vpc_id:
-                vpc_resources[resource_id] = resource
-        
-        # Add resources attached to the VPC (via relationships)
+
+        # Locate the VPC and determine its owning account/region
+        selected_account_id: Optional[str] = None
+        selected_vpc_resource: Optional[BaseResource] = None
+        selected_region_name: Optional[str] = None
+
+        for acct_id, acct in self.topology.organization.accounts.items():
+            if account_id and acct_id != account_id:
+                continue
+            for region_name, region_data in acct.regions.items():
+                res = region_data.resources.get(vpc_id)
+                if res and res.resource_type == ResourceType.VPC:
+                    selected_account_id = acct_id
+                    selected_vpc_resource = res
+                    selected_region_name = region_name
+                    break
+            if selected_vpc_resource:
+                break
+
+        if not selected_vpc_resource:
+            # Fallback: use any resource with matching id (prevents empty view)
+            res = all_resources.get(vpc_id)
+            if res:
+                selected_vpc_resource = res
+                selected_account_id = res.location.account_id
+                selected_region_name = res.location.region
+
+        vpc_resources: Dict[str, BaseResource] = {}
+        if selected_vpc_resource:
+            vpc_resources[vpc_id] = selected_vpc_resource
+
+        # Collect membership resources from the owning account only
+        if selected_account_id:
+            acct = self.topology.organization.accounts[selected_account_id]
+            for region_name, region_data in acct.regions.items():
+                for rid, resource in region_data.resources.items():
+                    if resource.properties.get('vpc_id') == vpc_id:
+                        vpc_resources[rid] = resource
+
+        # Add resources attached to the VPC within the owning account (via relationships)
         all_relationships = self._get_all_relationships()
+        if selected_account_id:
+            acct = self.topology.organization.accounts[selected_account_id]
+            for region_name, region_data in acct.regions.items():
+                for relationship in region_data.relationships:
+                    if (
+                        relationship.relationship_type == RelationshipType.ATTACHED_TO and
+                        relationship.target_id == vpc_id
+                    ):
+                        src = region_data.resources.get(relationship.source_id)
+                        if src:
+                            vpc_resources[src.resource_id] = src
+
+        # Include one-hop contained children from known VPC resources (e.g., subnets contain services/lambdas)
         for relationship in all_relationships:
-            if (relationship.relationship_type == RelationshipType.ATTACHED_TO and
-                relationship.target_id == vpc_id):
-                source_resource = all_resources.get(relationship.source_id)
-                if source_resource:
-                    vpc_resources[relationship.source_id] = source_resource
+            if relationship.relationship_type == RelationshipType.CONTAINS and relationship.source_id in vpc_resources:
+                child = self._get_all_resources().get(relationship.target_id)
+                if child:
+                    vpc_resources[child.resource_id] = child
 
         # Include VPC peering connection resources that involve this VPC
         for resource_id, resource in all_resources.items():
@@ -415,25 +460,46 @@ class ViewEngine:
                                     vpc_resources[peer_id] = synthetic
                                     break
         
-        # Apply account and region filters if specified
+        # Apply optional explicit filters for account/region without cross-account expansion
         if account_id:
-            vpc_resources = {
-                rid: res for rid, res in vpc_resources.items()
-                if res.location.account_id == account_id
-            }
-        
+            vpc_resources = {rid: res for rid, res in vpc_resources.items() if res.location.account_id == account_id}
         if region:
-            vpc_resources = {
-                rid: res for rid, res in vpc_resources.items()
-                if res.location.region == region
-            }
+            vpc_resources = {rid: res for rid, res in vpc_resources.items() if res.location.region == region}
         
         # Filter relationships to only include those between VPC resources
         vpc_relationships = []
         for relationship in all_relationships:
-            if (relationship.source_id in vpc_resources and
-                relationship.target_id in vpc_resources):
+            if (
+                relationship.source_id in vpc_resources and
+                relationship.target_id in vpc_resources
+            ):
                 vpc_relationships.append(relationship)
+
+        # If no explicit PEERS_WITH relationship was collected, synthesize it from peering resources
+        has_peer_rel = any(
+            rel.relationship_type == RelationshipType.PEERS_WITH and 
+            (rel.source_id == vpc_id or rel.target_id == vpc_id)
+            for rel in vpc_relationships
+        )
+        if not has_peer_rel:
+            for rid, res in vpc_resources.items():
+                try:
+                    rtype = res.resource_type
+                except Exception:
+                    rtype = None
+                if rtype == ResourceType.VPC_PEERING:
+                    req_vpc = (res.properties.get('requester_vpc') or {}).get('VpcId')
+                    acc_vpc = (res.properties.get('accepter_vpc') or {}).get('VpcId')
+                    if vpc_id in {req_vpc, acc_vpc}:
+                        peer_id = req_vpc if acc_vpc == vpc_id else acc_vpc
+                        if peer_id and peer_id in vpc_resources:
+                            vpc_relationships.append(Relationship(
+                                source_id=vpc_id,
+                                target_id=peer_id,
+                                relationship_type=RelationshipType.PEERS_WITH,
+                                properties={'inferred': True}
+                            ))
+                            break
         
         # Create metadata
         metadata = {

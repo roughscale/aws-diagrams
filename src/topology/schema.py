@@ -33,6 +33,7 @@ class ResourceType(Enum):
     LAMBDA_FUNCTION = "lambda_function"
     TRANSIT_GATEWAY = "transit_gateway"
     VPC_PEERING = "vpc_peering"
+    NETWORK_INTERFACE = "network_interface"
 
 
 class RelationshipType(Enum):
