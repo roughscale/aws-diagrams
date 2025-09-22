@@ -57,15 +57,15 @@ class AWSLabsTransformer:
     RESOURCE_TYPE_MAPPING = {
         ResourceType.VPC: "AWS::EC2::VPC",
         ResourceType.SUBNET: "AWS::EC2::Subnet", 
-        ResourceType.SECURITY_GROUP: "AWS::EC2::SecurityGroup",
+        ResourceType.SECURITY_GROUP: "AWS::EC2",  # avoid DAC warning
         ResourceType.INTERNET_GATEWAY: "AWS::EC2::InternetGateway",
         ResourceType.NAT_GATEWAY: "AWS::EC2::NatGateway",
         ResourceType.ROUTE_TABLE: "AWS::EC2::RouteTable",
-        ResourceType.NETWORK_ACL: "AWS::EC2::NetworkAcl",
+        ResourceType.NETWORK_ACL: "AWS::EC2",  # avoid DAC warning
         ResourceType.VPC_ENDPOINT: "AWS::EC2::VPCEndpoint",
         ResourceType.EC2_INSTANCE: "AWS::EC2::Instance",
         ResourceType.LOAD_BALANCER: "AWS::ElasticLoadBalancingV2::LoadBalancer",
-        ResourceType.TARGET_GROUP: "AWS::ElasticLoadBalancingV2::TargetGroup",
+        ResourceType.TARGET_GROUP: "AWS::ElasticLoadBalancingV2",  # avoid TG warning
         ResourceType.RDS_INSTANCE: "AWS::RDS::DBInstance",
         ResourceType.RDS_CLUSTER: "AWS::RDS::DBCluster",
         ResourceType.ELASTICACHE_CLUSTER: "AWS::ElastiCache::CacheCluster",
@@ -101,9 +101,10 @@ class AWSLabsTransformer:
         # Single-parent guards to avoid DAGs/cycles in DAC
         self._group_parent: Dict[str, str] = {}       # resource_id -> logical subnet node id
         self._tg_parent: Dict[str, str] = {}          # tg_id -> load_balancer_id
-        self._backend_parent: Dict[str, str] = {}     # backend_id -> target_group_id
-        # Explicit LB -> backend link intents for service-centric rendering
-        self._lb_backend_links: Set[Tuple[str, str]] = set()
+        # Explicit LB -> TG link intents for service-centric rendering
+        self._lb_tg_links: Set[Tuple[str, str]] = set()
+        self._tg_nodes_by_group: Dict[str, List[str]] = {}
+        self._tg_meta: Dict[str, Tuple[str, str]] = {}  # tg_node_id -> (lb_title, tg_title)
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -584,6 +585,8 @@ class AWSLabsTransformer:
                             lb_to_tgs[rel.source_id].append(rel.target_id)
 
             group_key = group_node_id
+            # Prepare per-group TG registry
+            self._tg_nodes_by_group.setdefault(group_node_id, [])
             for lb_id in lb_children:
                 lb_res = self.view.filtered_resources.get(lb_id)
                 lb_title = (lb_res.name if lb_res else None) or lb_id
@@ -593,12 +596,13 @@ class AWSLabsTransformer:
                         "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
                         "Title": lb_title,
                     }
-                tg_children_nodes: List[str] = []
+                same_group_tg_nodes: List[str] = []
                 for tg_id in lb_to_tgs.get(lb_id, []):
                     tg = self.view.filtered_resources.get(tg_id)
                     if not tg:
                         continue
                     svc_grand_children: List[str] = []
+                    target_subnets: List[str] = []
                     # ECS backends
                     for svc_id, svc in self.view.filtered_resources.items():
                         if svc.resource_type == ResourceType.ECS_SERVICE:
@@ -608,7 +612,9 @@ class AWSLabsTransformer:
                                 if child_id not in resources:
                                     resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
                                 svc_grand_children.append(child_id)
-                                self._lb_backend_links.add((lb_icon_id, child_id))
+                                # collect subnets for placement
+                                for s in (svc.properties or {}).get('subnet_ids') or []:
+                                    target_subnets.append(s)
                     # Lambda/EC2/IP backends
                     for t in tg.properties.get('targets') or []:
                         tid = t.get('id')
@@ -620,34 +626,82 @@ class AWSLabsTransformer:
                             if child_id not in resources:
                                 resources[child_id] = {"Type": "AWS::Lambda::Function", "Title": (lf.name if lf else None) or tid}
                             svc_grand_children.append(child_id)
-                            self._lb_backend_links.add((lb_icon_id, child_id))
+                            if lf:
+                                for s in (lf.properties or {}).get('subnet_ids') or []:
+                                    target_subnets.append(s)
                         elif str(tid).startswith('i-'):
                             child_id = f"ec2-{tid}-in-{group_key}"
                             if child_id not in resources:
                                 resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": tid}
                             svc_grand_children.append(child_id)
-                            self._lb_backend_links.add((lb_icon_id, child_id))
+                            inst = self.view.filtered_resources.get(tid)
+                            if inst:
+                                s = (inst.properties or {}).get('subnet_id')
+                                if s:
+                                    target_subnets.append(s)
                         elif '.' in str(tid):
                             ip = str(tid)
                             port = t.get('port')
-                            child_id = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
-                            if child_id not in resources:
-                                title = f"IP {ip}{(':'+str(port)) if port else ''}"
-                                resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": title}
-                            svc_grand_children.append(child_id)
-                            self._lb_backend_links.add((lb_icon_id, child_id))
-                    # Build TG stack vertical with row
-                    tg_node_id = f"tg-{tg_id}-under-{lb_icon_id}"
+                            # Deduplicate IP if it maps to a known service already included
+                            mapped_svc = self._find_service_id_by_ip(ip)
+                            if mapped_svc:
+                                ecs_child = f"ecs-{mapped_svc}-in-{group_key}"
+                                lam_child = f"lambda-{mapped_svc}-in-{group_key}"
+                                if ecs_child in svc_grand_children or lam_child in svc_grand_children:
+                                    # Skip adding IP node
+                                    pass
+                                else:
+                                    # Fallback: still show IP if mapped service node wasn't added
+                                    ip_child = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
+                                    if ip_child not in resources:
+                                        title = f"IP {ip}{(':'+str(port)) if port else ''}"
+                                        resources[ip_child] = {"Type": "AWS::EC2::Instance", "Title": title}
+                                    svc_grand_children.append(ip_child)
+                            else:
+                                ip_child = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
+                                if ip_child not in resources:
+                                    title = f"IP {ip}{(':'+str(port)) if port else ''}"
+                                    resources[ip_child] = {"Type": "AWS::EC2::Instance", "Title": title}
+                                svc_grand_children.append(ip_child)
+                            # map IP to ENI to get subnet
+                            for rid, res in self.view.filtered_resources.items():
+                                if getattr(res, 'resource_type', None) == ResourceType.NETWORK_INTERFACE and (res.properties or {}).get('private_ip') == ip:
+                                    s = (res.properties or {}).get('subnet_id')
+                                    if s:
+                                        target_subnets.append(s)
+                    # Decide placement group for TG by majority of target subnets
+                    place_group_node = group_node_id
+                    if target_subnets:
+                        counts: Dict[str, int] = {}
+                        for s in target_subnets:
+                            for gname, subs in group_to_subnets.items():
+                                if s in subs:
+                                    gnode = f"{vpc_id}-{gname}-logical-subnet"
+                                    counts[gnode] = counts.get(gnode, 0) + 1
+                                    break
+                        if counts:
+                            place_group_node = max(counts, key=counts.get)
+                    # Build TG stack vertical with row; register under placement group
+                    tg_node_id = f"tg-{tg_id}-in-{place_group_node}"
                     targets_row_id = f"{tg_node_id}-targets-row"
                     resources[targets_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": svc_grand_children or []}
-                    resources[tg_node_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": f"TG: {(tg.name or 'Target Group')}", "Children": [targets_row_id]}
-                    tg_children_nodes.append(tg_node_id)
+                    tg_title = f"TG: {(tg.name or 'Target Group')}"
+                    resources[tg_node_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": tg_title, "Children": [targets_row_id]}
+                    if place_group_node == group_node_id:
+                        # Same logical subnet: show TG stack under LB stack (vertical)
+                        same_group_tg_nodes.append(tg_node_id)
+                    else:
+                        # Cross-subnet: place TG in its target group and link LB->TG
+                        self._tg_nodes_by_group.setdefault(place_group_node, []).append(tg_node_id)
+                        self._lb_tg_links.add((lb_icon_id, tg_node_id))
+                    # Record meta for ordering in target groups
+                    self._tg_meta[tg_node_id] = (lb_title, tg.name or tg_id)
                 # Build LB stack
                 lb_stack_id = f"lb-{lb_id}-box-in-{group_key}"
                 lb_children_nodes = [lb_icon_id]
-                if tg_children_nodes:
+                if same_group_tg_nodes:
                     tg_row_id = f"{lb_stack_id}-tg-row"
-                    resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_children_nodes}
+                    resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": same_group_tg_nodes}
                     lb_children_nodes.append(tg_row_id)
                 resources[lb_stack_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": lb_title, "Children": lb_children_nodes}
                 lb_stack_ids.append(lb_stack_id)
@@ -731,7 +785,7 @@ class AWSLabsTransformer:
                         resources[node_id] = {"Type": "AWS::EC2::VPCEndpoint", "Title": "\n".join(title_lines)}
                     vpce_nodes.append(node_id)
 
-            # Orphan ENIs (exclude VPCE and ENIs member_of ECS services and LB/Lambda ENIs)
+            # Orphan ENIs (exclude VPCE and ENIs member_of ECS services and LB/Lambda ENIs, NAT/TGW ENIs)
             # Collect VPCE ENI IDs
             vpce_eni_ids: set = set()
             for rid2, res2 in self.view.filtered_resources.items():
@@ -755,18 +809,31 @@ class AWSLabsTransformer:
                 for sg in lb_res.properties.get('security_group_ids', []) or []:
                     lb_sg_ids.add(sg)
 
+            # Collect NAT-related ENI IDs in this group's subnets (e.g., from NatGatewayAddresses)
+            nat_eni_ids: set = set()
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type == ResourceType.NAT_GATEWAY and res2.properties.get('subnet_id') in subnet_set:
+                    for addr in res2.properties.get('nat_gateway_addresses', []) or []:
+                        eni_id = addr.get('NetworkInterfaceId') or addr.get('NetworkInterface')
+                        if eni_id:
+                            nat_eni_ids.add(eni_id)
+
             eni_ids: List[str] = []
             for rid2, res2 in self.view.filtered_resources.items():
                 if res2.resource_type == ResourceType.NETWORK_INTERFACE and res2.properties.get('subnet_id') in subnet_set:
                     desc = (res2.properties.get('description') or '').lower()
                     sgs = set(res2.properties.get('security_group_ids') or [])
-                    # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned (ELB in desc or SG overlap), Lambda ENIs
+                    iface_type = (res2.properties.get('interface_type') or '').lower()
+                    # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned (ELB in desc or SG overlap), Lambda ENIs, NAT ENIs, TGW ENIs
                     if (
                         res2.resource_id in vpce_eni_ids or
                         res2.resource_id in member_eni_ids or
                         'elb' in desc or 'elastic load balancer' in desc or
                         'lambda' in desc or
-                        (lb_sg_ids and (sgs & lb_sg_ids))
+                        (lb_sg_ids and (sgs & lb_sg_ids)) or
+                        res2.resource_id in nat_eni_ids or
+                        iface_type == 'nat_gateway' or 'nat gateway' in desc or
+                        iface_type == 'transit_gateway' or 'transit gateway' in desc or 'tgw' in desc
                     ):
                         continue
                     eni_ids.append(rid2)
@@ -777,23 +844,138 @@ class AWSLabsTransformer:
                 resources[aux_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": aux_nodes}
                 extra_row_ids.append(aux_row_id)
 
-            # Build a grid of service nodes: LB stacks plus standalone services
-            service_nodes = lb_stack_ids[:]
-            # Append standalone services (not rendered under TGs)
-            for rid in svc_children:
-                service_nodes.append(rid)
-            svc_ids = service_nodes
-            grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", svc_ids)
-            # Optionally add ENI/NAT/TGW rows
-            rows = grid_rows or svc_ids
-            rows.extend(extra_row_ids)
-            resources[group_node_id] = {
-                "Type": "AWS::EC2::Subnet",
-                "Title": group_name.replace('-', ' ').title(),
-                "Preset": preset,
-                "Children": rows,
-            }
-            additions.append(group_node_id)
+        # Security Group overlays (draw boxes around members in this logical subnet)
+        sg_overlays: List[str] = []
+        # Collect SG -> member node ids for this group
+        sg_members: Dict[str, List[str]] = {}
+        # Helper to register a member for an sg
+        def _add_sg_member(sg_id: str, node_id: str):
+            if not sg_id or not node_id:
+                return
+            sg_members.setdefault(sg_id, [])
+            if node_id not in sg_members[sg_id]:
+                sg_members[sg_id].append(node_id)
+
+        # LBs in this group
+        for lb_id in lb_children:
+            lb = self.view.filtered_resources.get(lb_id)
+            if not lb:
+                continue
+            for sg in (lb.properties or {}).get('security_group_ids') or []:
+                node_id = f"lb-icon-{lb_id}-in-{group_node_id}"
+                if node_id in resources:
+                    _add_sg_member(sg, node_id)
+
+        # ECS services via ENIs in this group's subnets
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.MEMBER_OF:
+                continue
+            eni = self.view.filtered_resources.get(rel.source_id)
+            svc = self.view.filtered_resources.get(rel.target_id)
+            if not eni or not svc:
+                continue
+            if getattr(eni, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
+                continue
+            if getattr(svc, 'resource_type', None) != ResourceType.ECS_SERVICE:
+                continue
+            sid = (eni.properties or {}).get('subnet_id')
+            if sid not in subnet_set:
+                continue
+            node_id = f"ecs-{svc.resource_id}-in-{group_node_id}"
+            if node_id in resources:
+                for sg in (eni.properties or {}).get('security_group_ids') or []:
+                    _add_sg_member(sg, node_id)
+
+        # Lambda functions: direct SGs on function config
+        for rid, res in self.view.filtered_resources.items():
+            if getattr(res, 'resource_type', None) != ResourceType.LAMBDA_FUNCTION:
+                continue
+            # Only include if function is rendered in this group
+            node_id = f"lambda-{res.resource_id}-in-{group_node_id}"
+            if node_id not in resources:
+                continue
+            for sg in (res.properties or {}).get('security_group_ids') or []:
+                _add_sg_member(sg, node_id)
+
+        # EC2 instances (if present)
+        for rid, res in self.view.filtered_resources.items():
+            if getattr(res, 'resource_type', None) != ResourceType.EC2_INSTANCE:
+                continue
+            node_id = f"ec2-{res.resource_id}-in-{group_node_id}"
+            if node_id not in resources:
+                continue
+            for sg in (res.properties or {}).get('security_group_ids') or []:
+                _add_sg_member(sg, node_id)
+
+        # Build overlay containers with BorderChildren
+        if sg_members:
+            sg_row_id = f"{group_node_id}-sg-overlays"
+            sg_children_ids: List[str] = []
+            for sg_id, members in sg_members.items():
+                if not members:
+                    continue
+                # Resolve SG name (if present in topology resources)
+                sg_name = None
+                sg_res = self.view.filtered_resources.get(sg_id)
+                if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                    sg_name = sg_res.name or sg_res.properties.get('group_name')
+                title = f"SG: {sg_name or sg_id}"
+                box_id = f"sg-box-{sg_id}-in-{group_node_id}"
+                resources[box_id] = {
+                    "Type": "AWS::Diagram::VerticalStack",
+                    "Title": title,
+                    "FillColor": "rgba(0,0,0,0)",
+                    "BorderColor": "rgba(60,60,60,180)",
+                    "Children": [],
+                    "BorderChildren": members,
+                }
+                sg_children_ids.append(box_id)
+            if sg_children_ids:
+                resources[sg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": sg_children_ids}
+                extra_row_ids.append(sg_row_id)
+
+        # Build ordered content for this group
+        rows: List[str] = []
+        # 1) Cross-subnet TG stacks come first (left-justified row)
+        tg_nodes_here = self._tg_nodes_by_group.get(group_node_id, [])
+        if tg_nodes_here:
+            tg_sorted = sorted(tg_nodes_here, key=lambda nid: self._tg_meta.get(nid, ("", nid)))
+            tg_row_id = f"{group_node_id}-tg-cross-row"
+            resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_sorted}
+            rows.append(tg_row_id)
+        # 2) Then LB stacks and standalone services arranged in grid
+        service_nodes = lb_stack_ids[:]
+        for rid in svc_children:
+            service_nodes.append(rid)
+        grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", service_nodes)
+        rows.extend(grid_rows or service_nodes)
+        # 3) Then aux rows (VPCE/ENIs/NAT/TGW)
+        rows.extend(extra_row_ids)
+        # Append CIDR ranges of member subnets to the logical subnet title for clarity
+        cidrs: List[str] = []
+        for sid in subnet_ids:
+            sres = self.view.filtered_resources.get(sid)
+            if not sres:
+                continue
+            c = None
+            try:
+                if hasattr(sres, 'cidr_blocks') and sres.cidr_blocks:
+                    c = sres.cidr_blocks[0]
+                else:
+                    c = sres.properties.get('cidr_block') or sres.properties.get('CidrBlock')
+            except Exception:
+                c = None
+            if c and c not in cidrs:
+                cidrs.append(c)
+        cidr_suffix = f" ({', '.join(cidrs)})" if cidrs else ""
+
+        resources[group_node_id] = {
+            "Type": "AWS::EC2::Subnet",
+            "Title": group_name.replace('-', ' ').title() + cidr_suffix,
+            "Preset": preset,
+            "Children": rows,
+        }
+        additions.append(group_node_id)
 
         return additions
     
@@ -826,6 +1008,27 @@ class AWSLabsTransformer:
             elif resource.resource_type == ResourceType.TARGET_GROUP:
                 # Do not render TGs as standalone nodes in service-centric layout
                 continue
+
+            elif resource.resource_type == ResourceType.ECS_SERVICE:
+                # Append backend ENI IPs under the service title when available
+                title = resource.name or resource_id
+                ips = self._get_service_backend_ips(resource_id)
+                resource_def["Title"] = self._format_title_with_ips(title, ips)
+
+            elif resource.resource_type == ResourceType.LAMBDA_FUNCTION:
+                # Append guessed Lambda ENI IPs (best-effort) under the title
+                title = resource.name or resource_id
+                ips = self._get_service_backend_ips(resource_id)
+                if not ips:
+                    ips = self._guess_lambda_ips(resource)
+                resource_def["Title"] = self._format_title_with_ips(title, ips)
+
+            elif resource.resource_type == ResourceType.NETWORK_INTERFACE:
+                # Show ENI private IP beneath the title
+                title = resource.name or resource_id
+                ip = (resource.properties or {}).get('private_ip')
+                if ip:
+                    resource_def["Title"] = f"{title}\n{ip}"
                     
             elif resource.resource_type == ResourceType.INTERNET_GATEWAY:
                 # Internet Gateway styling
@@ -851,18 +1054,18 @@ class AWSLabsTransformer:
         """
         links: List[Dict[str, Any]] = []
 
-        # Synthesize LB -> backend links for service-centric view only
+        # Synthesize LB -> TG links for service-centric view only (cross-group allowed)
         seen = set()
-        for lb_id, backend_id in sorted(self._lb_backend_links):
-            if lb_id not in resources or backend_id not in resources:
+        for lb_id, tg_id in sorted(self._lb_tg_links):
+            if lb_id not in resources or tg_id not in resources:
                 continue
-            key = (lb_id, backend_id)
+            key = (lb_id, tg_id)
             if key in seen:
                 continue
             seen.add(key)
             link = {
                 "Source": lb_id,
-                "Target": backend_id,
+                "Target": tg_id,
                 "Type": "orthogonal",
                 "SourcePosition": "S",
                 "TargetPosition": "N",
@@ -980,6 +1183,80 @@ class AWSLabsTransformer:
             parts = service_name.split('.')
             if len(parts) >= 3:
                 return parts[-1].upper()  # e.g., 'S3', 'ECR', 'SSM'
+        return None
+
+    def _get_service_backend_ips(self, service_id: str) -> List[str]:
+        """Collect backend ENI IPs for a service by scanning MEMBER_OF relationships.
+
+        Works for ECS services (explicit MEMBER_OF from ENI -> Service). For Lambda,
+        this may return empty unless ENI MEMBER_OF relationships exist; a separate
+        heuristic is applied in _guess_lambda_ips.
+        """
+        ips: List[str] = []
+        seen = set()
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.MEMBER_OF:
+                continue
+            if rel.target_id != service_id:
+                continue
+            eni = self.view.filtered_resources.get(rel.source_id)
+            if not eni or getattr(eni, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
+                continue
+            ip = (eni.properties or {}).get('private_ip')
+            if ip and ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        return ips
+
+    def _guess_lambda_ips(self, lambda_res: BaseResource) -> List[str]:
+        """Best-effort guess of Lambda ENI IPs by matching ENI descriptions and subnets.
+
+        Uses function name/ARN substring match plus subnet filtering.
+        """
+        ips: List[str] = []
+        seen = set()
+        lname = (lambda_res.name or lambda_res.resource_id).lower()
+        lsubs = set((lambda_res.properties or {}).get('subnet_ids') or [])
+        for rid, res in self.view.filtered_resources.items():
+            if getattr(res, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
+                continue
+            desc = (res.properties or {}).get('description') or ''
+            sid = (res.properties or {}).get('subnet_id')
+            if lname and lname in desc.lower() and (not lsubs or (sid in lsubs)):
+                ip = (res.properties or {}).get('private_ip')
+                if ip and ip not in seen:
+                    seen.add(ip)
+                    ips.append(ip)
+        return ips
+
+    def _format_title_with_ips(self, title: str, ips: List[str], limit: int = 5) -> str:
+        if not ips:
+            return title
+        shown = ips[:limit]
+        suffix = " …" if len(ips) > limit else ""
+        return f"{title}\n{', '.join(shown)}{suffix}"
+
+    def _find_service_id_by_ip(self, ip: str) -> Optional[str]:
+        """Return the service/func resource_id that owns the ENI for this IP, if known.
+
+        Matches ENI.private_ip == ip, then walks MEMBER_OF relationships to
+        ECS_SERVICE or LAMBDA_FUNCTION.
+        """
+        eni_id = None
+        for rid, res in self.view.filtered_resources.items():
+            if getattr(res, 'resource_type', None) == ResourceType.NETWORK_INTERFACE and (res.properties or {}).get('private_ip') == ip:
+                eni_id = rid
+                break
+        if not eni_id:
+            return None
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.MEMBER_OF:
+                continue
+            if rel.source_id != eni_id:
+                continue
+            tgt = self.view.filtered_resources.get(rel.target_id)
+            if tgt and tgt.resource_type in (ResourceType.ECS_SERVICE, ResourceType.LAMBDA_FUNCTION):
+                return rel.target_id
         return None
 
     def _get_vpce_service_id(self, service_name: str) -> Optional[str]:
