@@ -609,13 +609,13 @@ class AWSLabsTransformer:
                             tgs = set(svc.properties.get('target_group_arns') or [])
                             if tg_id in tgs:
                                 child_id = f"ecs-{svc_id}-in-{group_key}"
-                                if child_id not in resources:
+                                # Check if this ECS service is already placed elsewhere to prevent cycles
+                                if child_id not in resources and svc_id not in self._group_parent:
                                     resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
                                     # Mark this ECS service as owned by a target group to prevent duplicate placement
-                                    if svc_id not in self._group_parent:
-                                        self._group_parent[svc_id] = f"tg-owned-{tg_id}"
-                                svc_grand_children.append(child_id)
-                                # collect subnets for placement
+                                    self._group_parent[svc_id] = f"tg-owned-{tg_id}"
+                                    svc_grand_children.append(child_id)
+                                # Always collect subnets for placement regardless of whether we create the node
                                 for s in (svc.properties or {}).get('subnet_ids') or []:
                                     target_subnets.append(s)
                     # Lambda/EC2/IP backends
@@ -626,17 +626,21 @@ class AWSLabsTransformer:
                         if str(tid).startswith('arn:aws:lambda:'):
                             child_id = f"lambda-{tid}-in-{group_key}"
                             lf = self.view.filtered_resources.get(tid)
-                            if child_id not in resources:
+                            # Check if this Lambda is already placed elsewhere to prevent cycles
+                            if child_id not in resources and tid not in self._group_parent:
                                 resources[child_id] = {"Type": "AWS::Lambda::Function", "Title": (lf.name if lf else None) or tid}
-                            svc_grand_children.append(child_id)
+                                self._group_parent[tid] = f"tg-owned-{tg_id}"
+                                svc_grand_children.append(child_id)
                             if lf:
                                 for s in (lf.properties or {}).get('subnet_ids') or []:
                                     target_subnets.append(s)
                         elif str(tid).startswith('i-'):
                             child_id = f"ec2-{tid}-in-{group_key}"
-                            if child_id not in resources:
+                            # Check if this EC2 instance is already placed elsewhere to prevent cycles
+                            if child_id not in resources and tid not in self._group_parent:
                                 resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": tid}
-                            svc_grand_children.append(child_id)
+                                self._group_parent[tid] = f"tg-owned-{tg_id}"
+                                svc_grand_children.append(child_id)
                             inst = self.view.filtered_resources.get(tid)
                             if inst:
                                 s = (inst.properties or {}).get('subnet_id')
