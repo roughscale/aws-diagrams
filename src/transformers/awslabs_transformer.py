@@ -105,18 +105,6 @@ class AWSLabsTransformer:
         self._lb_tg_links: Set[Tuple[str, str]] = set()
         self._tg_nodes_by_group: Dict[str, List[str]] = {}
         self._tg_meta: Dict[str, Tuple[str, str]] = {}  # tg_node_id -> (lb_title, tg_title)
-        # Track resources used as children to prevent cycles in BorderChildren
-        self._used_as_children: Set[str] = set()
-        
-    def _track_children_usage(self, resources: Dict[str, Any]) -> None:
-        """Track all resources that are used as children to prevent cycles."""
-        for resource_id, resource_def in resources.items():
-            if isinstance(resource_def, dict) and "Children" in resource_def:
-                children = resource_def.get("Children", [])
-                if isinstance(children, list):
-                    for child in children:
-                        if isinstance(child, str):
-                            self._used_as_children.add(child)
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -623,6 +611,9 @@ class AWSLabsTransformer:
                                 child_id = f"ecs-{svc_id}-in-{group_key}"
                                 if child_id not in resources:
                                     resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
+                                    # Mark this ECS service as owned by a target group to prevent duplicate placement
+                                    if svc_id not in self._group_parent:
+                                        self._group_parent[svc_id] = f"tg-owned-{tg_id}"
                                 svc_grand_children.append(child_id)
                                 # collect subnets for placement
                                 for s in (svc.properties or {}).get('subnet_ids') or []:
@@ -933,15 +924,11 @@ class AWSLabsTransformer:
                         sg_name = sg_res.name or sg_res.properties.get('group_name')
                     title = f"SG: {sg_name or sg_id}"
                     box_id = f"sg-box-{sg_id}-in-{group_node_id}"
-                    # Track current children usage before creating BorderChildren
-                    self._track_children_usage(resources)
-                    
                     # Convert member strings to BorderChildren format
-                    # Filter out any members that don't exist in resources or are already used as children to avoid cycles
+                    # BorderChildren are visual borders and don't create parent-child relationships, so they're safe from cycles
                     border_children = []
                     for member in members:
-                        if (member in resources and 
-                            member not in self._used_as_children):  # Avoid cycles by excluding already used children
+                        if member in resources:  # Only check if the resource exists
                             border_children.append({
                                 "Position": "N",  # Default position, could be made smarter
                                 "Resource": member
