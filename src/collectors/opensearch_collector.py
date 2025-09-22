@@ -65,7 +65,7 @@ class OpenSearchCollector(BaseCollector):
                         resource_id=domain_arn,
                         resource_type=ResourceType.OPENSEARCH_DOMAIN,
                         name=domain_name,
-                        location=self.location,
+                        location=self.create_resource_location(),
                         properties={
                             'domain_name': domain_name,
                             'engine_version': domain.get('EngineVersion'),
@@ -86,7 +86,7 @@ class OpenSearchCollector(BaseCollector):
                             'domain_endpoint_options': domain.get('DomainEndpointOptions', {}),
                             'advanced_security_options': domain.get('AdvancedSecurityOptions', {})
                         },
-                        metadata=self._create_metadata()
+                        metadata=self.create_resource_metadata(tags={})
                     )
                     self.add_resource(resource)
 

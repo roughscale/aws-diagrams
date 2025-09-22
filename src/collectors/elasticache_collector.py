@@ -73,7 +73,7 @@ class ElastiCacheCollector(BaseCollector):
                     resource_id=cluster['CacheClusterId'],
                     resource_type=ResourceType.ELASTICACHE_CLUSTER,
                     name=cluster_id,
-                    location=self.location,
+                    location=self.create_resource_location(),
                     properties={
                         'cluster_id': cluster_id,
                         'engine': cluster.get('Engine'),
@@ -87,7 +87,7 @@ class ElastiCacheCollector(BaseCollector):
                         'status': cluster.get('CacheClusterStatus'),
                         'replication_group_id': cluster.get('ReplicationGroupId')
                     },
-                    metadata=self._create_metadata()
+                    metadata=self.create_resource_metadata(tags={})
                 )
                 self.add_resource(resource)
 
@@ -133,7 +133,7 @@ class ElastiCacheCollector(BaseCollector):
                         resource_id=rg_id,
                         resource_type=ResourceType.ELASTICACHE_CLUSTER,
                         name=rg_id,
-                        location=self.location,
+                        location=self.create_resource_location(),
                         properties={
                             'replication_group_id': rg_id,
                             'description': rg.get('Description'),
@@ -145,7 +145,7 @@ class ElastiCacheCollector(BaseCollector):
                             'automatic_failover': rg.get('AutomaticFailover'),
                             'multi_az': rg.get('MultiAZ')
                         },
-                        metadata=self._create_metadata()
+                        metadata=self.create_resource_metadata(tags={})
                     )
                     self.add_resource(resource)
 

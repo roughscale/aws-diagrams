@@ -72,7 +72,7 @@ class RedshiftCollector(BaseCollector):
                     resource_id=cluster['ClusterIdentifier'],
                     resource_type=ResourceType.REDSHIFT_CLUSTER,
                     name=cluster_id,
-                    location=self.location,
+                    location=self.create_resource_location(),
                     properties={
                         'cluster_identifier': cluster_id,
                         'node_type': cluster.get('NodeType'),
@@ -113,7 +113,7 @@ class RedshiftCollector(BaseCollector):
                         'resize_info': cluster.get('ResizeInfo'),
                         'aqua_configuration': cluster.get('AquaConfiguration')
                     },
-                    metadata=self._create_metadata()
+                    metadata=self.create_resource_metadata(tags={})
                 )
                 self.add_resource(resource)
 
