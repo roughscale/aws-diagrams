@@ -62,6 +62,7 @@ class RDSCollector(BaseCollector):
                     resource_id=instance_arn,
                     resource_type=ResourceType.RDS_INSTANCE,
                     name=instance_id,
+                    arn=instance_arn,
                     location=self.create_resource_location(),
                     properties={
                         'instance_id': instance_id,
@@ -121,6 +122,7 @@ class RDSCollector(BaseCollector):
                     resource_id=cluster_arn,
                     resource_type=ResourceType.RDS_CLUSTER,
                     name=cluster_id,
+                    arn=cluster_arn,
                     location=self.create_resource_location(),
                     properties={
                         'cluster_id': cluster_id,

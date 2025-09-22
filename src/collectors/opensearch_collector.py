@@ -65,6 +65,7 @@ class OpenSearchCollector(BaseCollector):
                         resource_id=domain_arn,
                         resource_type=ResourceType.OPENSEARCH_DOMAIN,
                         name=domain_name,
+                        arn=domain_arn,
                         location=self.create_resource_location(),
                         properties={
                             'domain_name': domain_name,

@@ -69,10 +69,13 @@ class ElastiCacheCollector(BaseCollector):
                 security_groups = [sg['SecurityGroupId'] for sg in cluster.get('SecurityGroups', [])]
 
                 # Create ElastiCache cluster resource
+                # Use ARN from AWS response
+                cluster_arn = cluster.get('ARN')
                 resource = BaseResource(
                     resource_id=cluster['CacheClusterId'],
                     resource_type=ResourceType.ELASTICACHE_CLUSTER,
                     name=cluster_id,
+                    arn=cluster_arn,
                     location=self.create_resource_location(),
                     properties={
                         'cluster_id': cluster_id,
@@ -129,10 +132,13 @@ class ElastiCacheCollector(BaseCollector):
 
                 # Create replication group resource (if we don't already have individual clusters)
                 if not member_clusters:  # Only if no individual clusters were found
+                    # Use ARN from AWS response
+                    rg_arn = rg.get('ARN')
                     resource = BaseResource(
                         resource_id=rg_id,
                         resource_type=ResourceType.ELASTICACHE_CLUSTER,
                         name=rg_id,
+                        arn=rg_arn,
                         location=self.create_resource_location(),
                         properties={
                             'replication_group_id': rg_id,

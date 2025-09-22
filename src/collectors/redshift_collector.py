@@ -68,10 +68,13 @@ class RedshiftCollector(BaseCollector):
                 security_groups = [sg['VpcSecurityGroupId'] for sg in cluster.get('VpcSecurityGroups', [])]
 
                 # Create Redshift cluster resource
+                # Use ARN from AWS response (try multiple possible fields)
+                cluster_arn = cluster.get('ARN') or cluster.get('ClusterArn') or cluster.get('ClusterNamespaceArn')
                 resource = BaseResource(
                     resource_id=cluster['ClusterIdentifier'],
                     resource_type=ResourceType.REDSHIFT_CLUSTER,
                     name=cluster_id,
+                    arn=cluster_arn,
                     location=self.create_resource_location(),
                     properties={
                         'cluster_identifier': cluster_id,
