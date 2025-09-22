@@ -881,8 +881,8 @@ class AWSLabsTransformer:
                                 "Type": "AWS::EC2::SecurityGroup",
                                 "Title": f"SG: {sg_name or sg_id}",
                                 "Children": [current_container],
-                                "FillColor": "rgba(255,165,0,0.1)",  # Light orange background
-                                "BorderColor": "rgba(255,165,0,0.8)"  # Orange border
+                                "FillColor": "#FFF4E6",  # Light orange background
+                                "BorderColor": "#FF8C00"  # Orange border
                             }
                             current_container = sg_container_id
 
@@ -929,8 +929,8 @@ class AWSLabsTransformer:
                             "Type": "AWS::EC2::SecurityGroup",
                             "Title": f"SG: {sg_name or sg_id}",
                             "Children": [current_container],
-                            "FillColor": "rgba(255,165,0,0.1)",  # Light orange background
-                            "BorderColor": "rgba(255,165,0,0.8)"  # Orange border
+                            "FillColor": "#FFF4E6",  # Light orange background
+                            "BorderColor": "#FF8C00"  # Orange border
                         }
                         current_container = sg_container_id
 
