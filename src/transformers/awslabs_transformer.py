@@ -844,138 +844,138 @@ class AWSLabsTransformer:
                 resources[aux_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": aux_nodes}
                 extra_row_ids.append(aux_row_id)
 
-        # Security Group overlays (draw boxes around members in this logical subnet)
-        sg_overlays: List[str] = []
-        # Collect SG -> member node ids for this group
-        sg_members: Dict[str, List[str]] = {}
-        # Helper to register a member for an sg
-        def _add_sg_member(sg_id: str, node_id: str):
-            if not sg_id or not node_id:
-                return
-            sg_members.setdefault(sg_id, [])
-            if node_id not in sg_members[sg_id]:
-                sg_members[sg_id].append(node_id)
+            # Security Group overlays (draw boxes around members in this logical subnet)
+            sg_overlays: List[str] = []
+            # Collect SG -> member node ids for this group
+            sg_members: Dict[str, List[str]] = {}
+            # Helper to register a member for an sg
+            def _add_sg_member(sg_id: str, node_id: str):
+                if not sg_id or not node_id:
+                    return
+                sg_members.setdefault(sg_id, [])
+                if node_id not in sg_members[sg_id]:
+                    sg_members[sg_id].append(node_id)
 
-        # LBs in this group
-        for lb_id in lb_children:
-            lb = self.view.filtered_resources.get(lb_id)
-            if not lb:
-                continue
-            for sg in (lb.properties or {}).get('security_group_ids') or []:
-                node_id = f"lb-icon-{lb_id}-in-{group_node_id}"
-                if node_id in resources:
-                    _add_sg_member(sg, node_id)
-
-        # ECS services via ENIs in this group's subnets
-        for rel in self.view.filtered_relationships:
-            if rel.relationship_type != RelationshipType.MEMBER_OF:
-                continue
-            eni = self.view.filtered_resources.get(rel.source_id)
-            svc = self.view.filtered_resources.get(rel.target_id)
-            if not eni or not svc:
-                continue
-            if getattr(eni, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
-                continue
-            if getattr(svc, 'resource_type', None) != ResourceType.ECS_SERVICE:
-                continue
-            sid = (eni.properties or {}).get('subnet_id')
-            if sid not in subnet_set:
-                continue
-            node_id = f"ecs-{svc.resource_id}-in-{group_node_id}"
-            if node_id in resources:
-                for sg in (eni.properties or {}).get('security_group_ids') or []:
-                    _add_sg_member(sg, node_id)
-
-        # Lambda functions: direct SGs on function config
-        for rid, res in self.view.filtered_resources.items():
-            if getattr(res, 'resource_type', None) != ResourceType.LAMBDA_FUNCTION:
-                continue
-            # Only include if function is rendered in this group
-            node_id = f"lambda-{res.resource_id}-in-{group_node_id}"
-            if node_id not in resources:
-                continue
-            for sg in (res.properties or {}).get('security_group_ids') or []:
-                _add_sg_member(sg, node_id)
-
-        # EC2 instances (if present)
-        for rid, res in self.view.filtered_resources.items():
-            if getattr(res, 'resource_type', None) != ResourceType.EC2_INSTANCE:
-                continue
-            node_id = f"ec2-{res.resource_id}-in-{group_node_id}"
-            if node_id not in resources:
-                continue
-            for sg in (res.properties or {}).get('security_group_ids') or []:
-                _add_sg_member(sg, node_id)
-
-        # Build overlay containers with BorderChildren
-        if sg_members:
-            sg_row_id = f"{group_node_id}-sg-overlays"
-            sg_children_ids: List[str] = []
-            for sg_id, members in sg_members.items():
-                if not members:
+            # LBs in this group
+            for lb_id in lb_children:
+                lb = self.view.filtered_resources.get(lb_id)
+                if not lb:
                     continue
-                # Resolve SG name (if present in topology resources)
-                sg_name = None
-                sg_res = self.view.filtered_resources.get(sg_id)
-                if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
-                    sg_name = sg_res.name or sg_res.properties.get('group_name')
-                title = f"SG: {sg_name or sg_id}"
-                box_id = f"sg-box-{sg_id}-in-{group_node_id}"
-                resources[box_id] = {
-                    "Type": "AWS::Diagram::VerticalStack",
-                    "Title": title,
-                    "FillColor": "rgba(0,0,0,0)",
-                    "BorderColor": "rgba(60,60,60,180)",
-                    "Children": [],
-                    "BorderChildren": members,
-                }
-                sg_children_ids.append(box_id)
-            if sg_children_ids:
-                resources[sg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": sg_children_ids}
-                extra_row_ids.append(sg_row_id)
+                for sg in (lb.properties or {}).get('security_group_ids') or []:
+                    node_id = f"lb-icon-{lb_id}-in-{group_node_id}"
+                    if node_id in resources:
+                        _add_sg_member(sg, node_id)
 
-        # Build ordered content for this group
-        rows: List[str] = []
-        # 1) Cross-subnet TG stacks come first (left-justified row)
-        tg_nodes_here = self._tg_nodes_by_group.get(group_node_id, [])
-        if tg_nodes_here:
-            tg_sorted = sorted(tg_nodes_here, key=lambda nid: self._tg_meta.get(nid, ("", nid)))
-            tg_row_id = f"{group_node_id}-tg-cross-row"
-            resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_sorted}
-            rows.append(tg_row_id)
-        # 2) Then LB stacks and standalone services arranged in grid
-        service_nodes = lb_stack_ids[:]
-        for rid in svc_children:
-            service_nodes.append(rid)
-        grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", service_nodes)
-        rows.extend(grid_rows or service_nodes)
-        # 3) Then aux rows (VPCE/ENIs/NAT/TGW)
-        rows.extend(extra_row_ids)
-        # Append CIDR ranges of member subnets to the logical subnet title for clarity
-        cidrs: List[str] = []
-        for sid in subnet_ids:
-            sres = self.view.filtered_resources.get(sid)
-            if not sres:
-                continue
-            c = None
-            try:
-                if hasattr(sres, 'cidr_blocks') and sres.cidr_blocks:
-                    c = sres.cidr_blocks[0]
-                else:
-                    c = sres.properties.get('cidr_block') or sres.properties.get('CidrBlock')
-            except Exception:
+            # ECS services via ENIs in this group's subnets
+            for rel in self.view.filtered_relationships:
+                if rel.relationship_type != RelationshipType.MEMBER_OF:
+                    continue
+                eni = self.view.filtered_resources.get(rel.source_id)
+                svc = self.view.filtered_resources.get(rel.target_id)
+                if not eni or not svc:
+                    continue
+                if getattr(eni, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
+                    continue
+                if getattr(svc, 'resource_type', None) != ResourceType.ECS_SERVICE:
+                    continue
+                sid = (eni.properties or {}).get('subnet_id')
+                if sid not in subnet_set:
+                    continue
+                node_id = f"ecs-{svc.resource_id}-in-{group_node_id}"
+                if node_id in resources:
+                    for sg in (eni.properties or {}).get('security_group_ids') or []:
+                        _add_sg_member(sg, node_id)
+
+            # Lambda functions: direct SGs on function config
+            for rid, res in self.view.filtered_resources.items():
+                if getattr(res, 'resource_type', None) != ResourceType.LAMBDA_FUNCTION:
+                    continue
+                # Only include if function is rendered in this group
+                node_id = f"lambda-{res.resource_id}-in-{group_node_id}"
+                if node_id not in resources:
+                    continue
+                for sg in (res.properties or {}).get('security_group_ids') or []:
+                    _add_sg_member(sg, node_id)
+
+            # EC2 instances (if present)
+            for rid, res in self.view.filtered_resources.items():
+                if getattr(res, 'resource_type', None) != ResourceType.EC2_INSTANCE:
+                    continue
+                node_id = f"ec2-{res.resource_id}-in-{group_node_id}"
+                if node_id not in resources:
+                    continue
+                for sg in (res.properties or {}).get('security_group_ids') or []:
+                    _add_sg_member(sg, node_id)
+
+            # Build overlay containers with BorderChildren
+            if sg_members:
+                sg_row_id = f"{group_node_id}-sg-overlays"
+                sg_children_ids: List[str] = []
+                for sg_id, members in sg_members.items():
+                    if not members:
+                        continue
+                    # Resolve SG name (if present in topology resources)
+                    sg_name = None
+                    sg_res = self.view.filtered_resources.get(sg_id)
+                    if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                        sg_name = sg_res.name or sg_res.properties.get('group_name')
+                    title = f"SG: {sg_name or sg_id}"
+                    box_id = f"sg-box-{sg_id}-in-{group_node_id}"
+                    resources[box_id] = {
+                        "Type": "AWS::Diagram::VerticalStack",
+                        "Title": title,
+                        "FillColor": "rgba(0,0,0,0)",
+                        "BorderColor": "rgba(60,60,60,180)",
+                        "Children": [],
+                        "BorderChildren": members,
+                    }
+                    sg_children_ids.append(box_id)
+                if sg_children_ids:
+                    resources[sg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": sg_children_ids}
+                    extra_row_ids.append(sg_row_id)
+
+            # Build ordered content for this group
+            rows: List[str] = []
+            # 1) Cross-subnet TG stacks come first (left-justified row)
+            tg_nodes_here = self._tg_nodes_by_group.get(group_node_id, [])
+            if tg_nodes_here:
+                tg_sorted = sorted(tg_nodes_here, key=lambda nid: self._tg_meta.get(nid, ("", nid)))
+                tg_row_id = f"{group_node_id}-tg-cross-row"
+                resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_sorted}
+                rows.append(tg_row_id)
+            # 2) Then LB stacks and standalone services arranged in grid
+            service_nodes = lb_stack_ids[:]
+            for rid in svc_children:
+                service_nodes.append(rid)
+            grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", service_nodes)
+            rows.extend(grid_rows or service_nodes)
+            # 3) Then aux rows (VPCE/ENIs/NAT/TGW)
+            rows.extend(extra_row_ids)
+            # Append CIDR ranges of member subnets to the logical subnet title for clarity
+            cidrs: List[str] = []
+            for sid in subnet_ids:
+                sres = self.view.filtered_resources.get(sid)
+                if not sres:
+                    continue
                 c = None
-            if c and c not in cidrs:
-                cidrs.append(c)
-        cidr_suffix = f" ({', '.join(cidrs)})" if cidrs else ""
+                try:
+                    if hasattr(sres, 'cidr_blocks') and sres.cidr_blocks:
+                        c = sres.cidr_blocks[0]
+                    else:
+                        c = sres.properties.get('cidr_block') or sres.properties.get('CidrBlock')
+                except Exception:
+                    c = None
+                if c and c not in cidrs:
+                    cidrs.append(c)
+            cidr_suffix = f" ({', '.join(cidrs)})" if cidrs else ""
 
-        resources[group_node_id] = {
-            "Type": "AWS::EC2::Subnet",
-            "Title": group_name.replace('-', ' ').title() + cidr_suffix,
-            "Preset": preset,
-            "Children": rows,
-        }
-        additions.append(group_node_id)
+            resources[group_node_id] = {
+                "Type": "AWS::EC2::Subnet",
+                "Title": group_name.replace('-', ' ').title() + cidr_suffix,
+                "Preset": preset,
+                "Children": rows,
+            }
+            additions.append(group_node_id)
 
         return additions
     
