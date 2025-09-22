@@ -149,6 +149,22 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from ..collectors.lambda_collector import LambdaCollector  # type: ignore
         except Exception:
             LambdaCollector = None  # type: ignore
+        try:
+            from ..collectors.rds_collector import RDSCollector  # type: ignore
+        except Exception:
+            RDSCollector = None  # type: ignore
+        try:
+            from ..collectors.elasticache_collector import ElastiCacheCollector  # type: ignore
+        except Exception:
+            ElastiCacheCollector = None  # type: ignore
+        try:
+            from ..collectors.opensearch_collector import OpenSearchCollector  # type: ignore
+        except Exception:
+            OpenSearchCollector = None  # type: ignore
+        try:
+            from ..collectors.redshift_collector import RedshiftCollector  # type: ignore
+        except Exception:
+            RedshiftCollector = None  # type: ignore
         from ..auth import MultiAccountAuthenticator
         from ..topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         try:
@@ -169,6 +185,22 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from collectors.lambda_collector import LambdaCollector  # type: ignore
         except Exception:
             LambdaCollector = None  # type: ignore
+        try:
+            from collectors.rds_collector import RDSCollector  # type: ignore
+        except Exception:
+            RDSCollector = None  # type: ignore
+        try:
+            from collectors.elasticache_collector import ElastiCacheCollector  # type: ignore
+        except Exception:
+            ElastiCacheCollector = None  # type: ignore
+        try:
+            from collectors.opensearch_collector import OpenSearchCollector  # type: ignore
+        except Exception:
+            OpenSearchCollector = None  # type: ignore
+        try:
+            from collectors.redshift_collector import RedshiftCollector  # type: ignore
+        except Exception:
+            RedshiftCollector = None  # type: ignore
         from auth import MultiAccountAuthenticator
         from topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         from topology.serializer import TopologyYAMLSerializer
@@ -274,6 +306,14 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
                 available_collectors['elbv2'] = ELBV2Collector  # type: ignore
             if 'LambdaCollector' in locals() and LambdaCollector:
                 available_collectors['lambda'] = LambdaCollector  # type: ignore
+            if 'RDSCollector' in locals() and RDSCollector:
+                available_collectors['rds'] = RDSCollector  # type: ignore
+            if 'ElastiCacheCollector' in locals() and ElastiCacheCollector:
+                available_collectors['elasticache'] = ElastiCacheCollector  # type: ignore
+            if 'OpenSearchCollector' in locals() and OpenSearchCollector:
+                available_collectors['opensearch'] = OpenSearchCollector  # type: ignore
+            if 'RedshiftCollector' in locals() and RedshiftCollector:
+                available_collectors['redshift'] = RedshiftCollector  # type: ignore
             
             if collectors:
                 selected_collectors = {

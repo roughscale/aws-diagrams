@@ -28,6 +28,8 @@ class ResourceType(Enum):
     RDS_INSTANCE = "rds_instance"
     RDS_CLUSTER = "rds_cluster"
     ELASTICACHE_CLUSTER = "elasticache_cluster"
+    OPENSEARCH_DOMAIN = "opensearch_domain"
+    REDSHIFT_CLUSTER = "redshift_cluster"
     ECS_CLUSTER = "ecs_cluster"
     ECS_SERVICE = "ecs_service"
     LAMBDA_FUNCTION = "lambda_function"

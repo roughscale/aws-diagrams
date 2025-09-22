@@ -69,6 +69,8 @@ class AWSLabsTransformer:
         ResourceType.RDS_INSTANCE: "AWS::RDS::DBInstance",
         ResourceType.RDS_CLUSTER: "AWS::RDS::DBCluster",
         ResourceType.ELASTICACHE_CLUSTER: "AWS::ElastiCache::CacheCluster",
+        ResourceType.OPENSEARCH_DOMAIN: "AWS::OpenSearchService::Domain",
+        ResourceType.REDSHIFT_CLUSTER: "AWS::Redshift::Cluster",
         ResourceType.ECS_CLUSTER: "AWS::ECS::Cluster",
         ResourceType.ECS_SERVICE: "AWS::ECS::Service",
         ResourceType.LAMBDA_FUNCTION: "AWS::Lambda::Function",
@@ -568,6 +570,21 @@ class AWSLabsTransformer:
                         if parent is None:
                             self._group_parent[rid] = group_node_id
                             lb_children.append(rid)
+                # ENI-based services that should be aggregated by logical subnet
+                elif res.resource_type in [
+                    ResourceType.RDS_INSTANCE,
+                    ResourceType.RDS_CLUSTER,
+                    ResourceType.ELASTICACHE_CLUSTER,
+                    ResourceType.OPENSEARCH_DOMAIN,
+                    ResourceType.REDSHIFT_CLUSTER
+                ]:
+                    # These services use ENIs but we want to show the service, not the ENIs
+                    service_subnets = set(res.properties.get('subnet_ids') or [])
+                    if service_subnets & subnet_set:
+                        parent = self._group_parent.get(rid)
+                        if parent is None:
+                            self._group_parent[rid] = group_node_id
+                            svc_children.append(rid)
 
             # Build per-LB stacks with TG stacks inside (code_unstable pattern)
             lb_stack_ids: List[str] = []
@@ -825,18 +842,44 @@ class AWSLabsTransformer:
                         if eni_id:
                             nat_eni_ids.add(eni_id)
 
+            # Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)
+            service_eni_ids: set = set()
+            for rid2, res2 in self.view.filtered_resources.items():
+                if res2.resource_type in [
+                    ResourceType.RDS_INSTANCE,
+                    ResourceType.RDS_CLUSTER,
+                    ResourceType.ELASTICACHE_CLUSTER,
+                    ResourceType.OPENSEARCH_DOMAIN,
+                    ResourceType.REDSHIFT_CLUSTER
+                ]:
+                    # Get ENI IDs associated with these services
+                    for eni_id in res2.properties.get('network_interface_ids', []) or []:
+                        service_eni_ids.add(eni_id)
+                    # Also check for ENI relationships
+                    for rel in self.view.filtered_relationships:
+                        if (rel.relationship_type == RelationshipType.MEMBER_OF and
+                            rel.target_id == rid2):
+                            eni = self.view.filtered_resources.get(rel.source_id)
+                            if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
+                                service_eni_ids.add(eni.resource_id)
+
             eni_ids: List[str] = []
             for rid2, res2 in self.view.filtered_resources.items():
                 if res2.resource_type == ResourceType.NETWORK_INTERFACE and res2.properties.get('subnet_id') in subnet_set:
                     desc = (res2.properties.get('description') or '').lower()
                     sgs = set(res2.properties.get('security_group_ids') or [])
                     iface_type = (res2.properties.get('interface_type') or '').lower()
-                    # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned (ELB in desc or SG overlap), Lambda ENIs, NAT ENIs, TGW ENIs
+                    # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned, Lambda ENIs, NAT ENIs, TGW ENIs, and aggregated services
                     if (
                         res2.resource_id in vpce_eni_ids or
                         res2.resource_id in member_eni_ids or
+                        res2.resource_id in service_eni_ids or  # ENIs belonging to RDS, ElastiCache, etc.
                         'elb' in desc or 'elastic load balancer' in desc or
                         'lambda' in desc or
+                        'rds' in desc or 'aurora' in desc or  # RDS/Aurora ENIs
+                        'elasticache' in desc or 'redis' in desc or 'memcached' in desc or  # ElastiCache ENIs
+                        'opensearch' in desc or 'elasticsearch' in desc or  # OpenSearch ENIs
+                        'redshift' in desc or  # Redshift ENIs
                         (lb_sg_ids and (sgs & lb_sg_ids)) or
                         res2.resource_id in nat_eni_ids or
                         iface_type == 'nat_gateway' or 'nat gateway' in desc or
