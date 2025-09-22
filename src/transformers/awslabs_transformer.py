@@ -921,13 +921,20 @@ class AWSLabsTransformer:
                         sg_name = sg_res.name or sg_res.properties.get('group_name')
                     title = f"SG: {sg_name or sg_id}"
                     box_id = f"sg-box-{sg_id}-in-{group_node_id}"
+                    # Convert member strings to BorderChildren format
+                    border_children = []
+                    for member in members:
+                        border_children.append({
+                            "Position": "N",  # Default position, could be made smarter
+                            "Resource": member
+                        })
                     resources[box_id] = {
                         "Type": "AWS::Diagram::VerticalStack",
                         "Title": title,
                         "FillColor": "rgba(0,0,0,0)",
                         "BorderColor": "rgba(60,60,60,180)",
                         "Children": [],
-                        "BorderChildren": members,
+                        "BorderChildren": border_children,
                     }
                     sg_children_ids.append(box_id)
                 if sg_children_ids:
