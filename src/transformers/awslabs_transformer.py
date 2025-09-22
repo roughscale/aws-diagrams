@@ -851,107 +851,51 @@ class AWSLabsTransformer:
                 resources[aux_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": aux_nodes}
                 extra_row_ids.append(aux_row_id)
 
-            # Security Group overlays (draw boxes around members in this logical subnet)
-            sg_overlays: List[str] = []
-            # Collect SG -> member node ids for this group
-            sg_members: Dict[str, List[str]] = {}
-            # Helper to register a member for an sg
-            def _add_sg_member(sg_id: str, node_id: str):
-                if not sg_id or not node_id:
-                    return
-                sg_members.setdefault(sg_id, [])
-                if node_id not in sg_members[sg_id]:
-                    sg_members[sg_id].append(node_id)
+            # Instead of BorderChildren overlays, create security group parent containers
+            # First, wrap load balancer stacks in their security group containers
+            wrapped_lb_stacks: List[str] = []
+            for lb_stack_id in lb_stack_ids:
+                # Find the corresponding load balancer ID
+                lb_id = None
+                for lb_id_candidate in lb_children:
+                    if f"lb-{lb_id_candidate}-box-in-{group_key}" == lb_stack_id:
+                        lb_id = lb_id_candidate
+                        break
 
-            # LBs in this group
-            for lb_id in lb_children:
-                lb = self.view.filtered_resources.get(lb_id)
-                if not lb:
-                    continue
-                for sg in (lb.properties or {}).get('security_group_ids') or []:
-                    node_id = f"lb-icon-{lb_id}-in-{group_node_id}"
-                    if node_id in resources:
-                        _add_sg_member(sg, node_id)
+                if lb_id:
+                    lb = self.view.filtered_resources.get(lb_id)
+                    if lb and lb.properties.get('security_group_ids'):
+                        # Create security group container for this load balancer
+                        sgs = lb.properties.get('security_group_ids', [])
+                        current_container = lb_stack_id
 
-            # ECS services via ENIs in this group's subnets
-            for rel in self.view.filtered_relationships:
-                if rel.relationship_type != RelationshipType.MEMBER_OF:
-                    continue
-                eni = self.view.filtered_resources.get(rel.source_id)
-                svc = self.view.filtered_resources.get(rel.target_id)
-                if not eni or not svc:
-                    continue
-                if getattr(eni, 'resource_type', None) != ResourceType.NETWORK_INTERFACE:
-                    continue
-                if getattr(svc, 'resource_type', None) != ResourceType.ECS_SERVICE:
-                    continue
-                sid = (eni.properties or {}).get('subnet_id')
-                if sid not in subnet_set:
-                    continue
-                node_id = f"ecs-{svc.resource_id}-in-{group_node_id}"
-                if node_id in resources:
-                    for sg in (eni.properties or {}).get('security_group_ids') or []:
-                        _add_sg_member(sg, node_id)
+                        # Wrap in security group containers (innermost to outermost)
+                        for sg_id in reversed(sgs):  # Reverse to create proper nesting
+                            sg_container_id = f"sg-{sg_id}-container-{lb_id}-in-{group_node_id}"
+                            sg_res = self.view.filtered_resources.get(sg_id)
+                            sg_name = None
+                            if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                                sg_name = sg_res.name or sg_res.properties.get('group_name')
 
-            # Lambda functions: direct SGs on function config
-            for rid, res in self.view.filtered_resources.items():
-                if getattr(res, 'resource_type', None) != ResourceType.LAMBDA_FUNCTION:
-                    continue
-                # Only include if function is rendered in this group
-                node_id = f"lambda-{res.resource_id}-in-{group_node_id}"
-                if node_id not in resources:
-                    continue
-                for sg in (res.properties or {}).get('security_group_ids') or []:
-                    _add_sg_member(sg, node_id)
+                            resources[sg_container_id] = {
+                                "Type": "AWS::EC2::SecurityGroup",
+                                "Title": f"SG: {sg_name or sg_id}",
+                                "Children": [current_container],
+                                "FillColor": "rgba(255,165,0,0.1)",  # Light orange background
+                                "BorderColor": "rgba(255,165,0,0.8)"  # Orange border
+                            }
+                            current_container = sg_container_id
 
-            # EC2 instances (if present)
-            for rid, res in self.view.filtered_resources.items():
-                if getattr(res, 'resource_type', None) != ResourceType.EC2_INSTANCE:
-                    continue
-                node_id = f"ec2-{res.resource_id}-in-{group_node_id}"
-                if node_id not in resources:
-                    continue
-                for sg in (res.properties or {}).get('security_group_ids') or []:
-                    _add_sg_member(sg, node_id)
+                        wrapped_lb_stacks.append(current_container)
+                    else:
+                        # No security groups, use original stack
+                        wrapped_lb_stacks.append(lb_stack_id)
+                else:
+                    # Fallback if we can't find the LB ID
+                    wrapped_lb_stacks.append(lb_stack_id)
 
-            # Build overlay containers with BorderChildren
-            if sg_members:
-                sg_row_id = f"{group_node_id}-sg-overlays"
-                sg_children_ids: List[str] = []
-                for sg_id, members in sg_members.items():
-                    if not members:
-                        continue
-                    # Resolve SG name (if present in topology resources)
-                    sg_name = None
-                    sg_res = self.view.filtered_resources.get(sg_id)
-                    if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
-                        sg_name = sg_res.name or sg_res.properties.get('group_name')
-                    title = f"SG: {sg_name or sg_id}"
-                    box_id = f"sg-box-{sg_id}-in-{group_node_id}"
-                    # Convert member strings to BorderChildren format
-                    # BorderChildren are visual borders and don't create parent-child relationships, so they're safe from cycles
-                    border_children = []
-                    for member in members:
-                        if member in resources:  # Only check if the resource exists
-                            border_children.append({
-                                "Position": "N",  # Default position, could be made smarter
-                                "Resource": member
-                            })
-                    
-                    # Only create the security group box if we have valid border children
-                    if border_children:
-                        resources[box_id] = {
-                            "Type": "AWS::Diagram::VerticalStack",
-                            "Title": title,
-                            "FillColor": "rgba(0,0,0,0)",
-                            "BorderColor": "rgba(60,60,60,180)",
-                            "Children": [],
-                            "BorderChildren": border_children,
-                        }
-                        sg_children_ids.append(box_id)
-                if sg_children_ids:
-                    resources[sg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": sg_children_ids}
-                    extra_row_ids.append(sg_row_id)
+            # Security groups for standalone services (ECS, Lambda, EC2) are handled
+            # when creating their respective nodes - no additional overlays needed here
 
             # Build ordered content for this group
             rows: List[str] = []
@@ -962,10 +906,38 @@ class AWSLabsTransformer:
                 tg_row_id = f"{group_node_id}-tg-cross-row"
                 resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_sorted}
                 rows.append(tg_row_id)
-            # 2) Then LB stacks and standalone services arranged in grid
-            service_nodes = lb_stack_ids[:]
+            # 2) Then LB stacks (wrapped in security groups) and standalone services arranged in grid
+            service_nodes = wrapped_lb_stacks[:]
+
+            # Wrap standalone services in their security groups too
             for rid in svc_children:
-                service_nodes.append(rid)
+                resource = self.view.filtered_resources.get(rid)
+                if resource and hasattr(resource, 'properties') and resource.properties.get('security_group_ids'):
+                    # Wrap this service in security group containers
+                    sgs = resource.properties.get('security_group_ids', [])
+                    current_container = rid
+
+                    # Wrap in security group containers (innermost to outermost)
+                    for sg_id in reversed(sgs):  # Reverse to create proper nesting
+                        sg_container_id = f"sg-{sg_id}-container-{rid}-in-{group_node_id}"
+                        sg_res = self.view.filtered_resources.get(sg_id)
+                        sg_name = None
+                        if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                            sg_name = sg_res.name or sg_res.properties.get('group_name')
+
+                        resources[sg_container_id] = {
+                            "Type": "AWS::EC2::SecurityGroup",
+                            "Title": f"SG: {sg_name or sg_id}",
+                            "Children": [current_container],
+                            "FillColor": "rgba(255,165,0,0.1)",  # Light orange background
+                            "BorderColor": "rgba(255,165,0,0.8)"  # Orange border
+                        }
+                        current_container = sg_container_id
+
+                    service_nodes.append(current_container)
+                else:
+                    # No security groups, use original service
+                    service_nodes.append(rid)
             grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", service_nodes)
             rows.extend(grid_rows or service_nodes)
             # 3) Then aux rows (VPCE/ENIs/NAT/TGW)
