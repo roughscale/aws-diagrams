@@ -105,6 +105,18 @@ class AWSLabsTransformer:
         self._lb_tg_links: Set[Tuple[str, str]] = set()
         self._tg_nodes_by_group: Dict[str, List[str]] = {}
         self._tg_meta: Dict[str, Tuple[str, str]] = {}  # tg_node_id -> (lb_title, tg_title)
+        # Track resources used as children to prevent cycles in BorderChildren
+        self._used_as_children: Set[str] = set()
+        
+    def _track_children_usage(self, resources: Dict[str, Any]) -> None:
+        """Track all resources that are used as children to prevent cycles."""
+        for resource_id, resource_def in resources.items():
+            if isinstance(resource_def, dict) and "Children" in resource_def:
+                children = resource_def.get("Children", [])
+                if isinstance(children, list):
+                    for child in children:
+                        if isinstance(child, str):
+                            self._used_as_children.add(child)
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -921,22 +933,31 @@ class AWSLabsTransformer:
                         sg_name = sg_res.name or sg_res.properties.get('group_name')
                     title = f"SG: {sg_name or sg_id}"
                     box_id = f"sg-box-{sg_id}-in-{group_node_id}"
+                    # Track current children usage before creating BorderChildren
+                    self._track_children_usage(resources)
+                    
                     # Convert member strings to BorderChildren format
+                    # Filter out any members that don't exist in resources or are already used as children to avoid cycles
                     border_children = []
                     for member in members:
-                        border_children.append({
-                            "Position": "N",  # Default position, could be made smarter
-                            "Resource": member
-                        })
-                    resources[box_id] = {
-                        "Type": "AWS::Diagram::VerticalStack",
-                        "Title": title,
-                        "FillColor": "rgba(0,0,0,0)",
-                        "BorderColor": "rgba(60,60,60,180)",
-                        "Children": [],
-                        "BorderChildren": border_children,
-                    }
-                    sg_children_ids.append(box_id)
+                        if (member in resources and 
+                            member not in self._used_as_children):  # Avoid cycles by excluding already used children
+                            border_children.append({
+                                "Position": "N",  # Default position, could be made smarter
+                                "Resource": member
+                            })
+                    
+                    # Only create the security group box if we have valid border children
+                    if border_children:
+                        resources[box_id] = {
+                            "Type": "AWS::Diagram::VerticalStack",
+                            "Title": title,
+                            "FillColor": "rgba(0,0,0,0)",
+                            "BorderColor": "rgba(60,60,60,180)",
+                            "Children": [],
+                            "BorderChildren": border_children,
+                        }
+                        sg_children_ids.append(box_id)
                 if sg_children_ids:
                     resources[sg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": sg_children_ids}
                     extra_row_ids.append(sg_row_id)
