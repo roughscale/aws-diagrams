@@ -890,18 +890,25 @@ class AWSLabsTransformer:
 
                     # EC2 Section (grouped by shared SGs)
                     if ec2_targets:
+                        logger.debug(f"Processing {len(ec2_targets)} EC2 targets for TG {tg_id}: {ec2_targets}")
                         ec2_section_id = f"ec2-section-{tg_id}-in-{group_key}"
                         ec2_nodes = []
 
                         for ec2_id in ec2_targets:
                             if ec2_id in self._group_parent:
+                                logger.debug(f"Skipping EC2 {ec2_id} - already in group parent")
                                 continue  # Already handled elsewhere
 
+                            logger.debug(f"Creating EC2 node for {ec2_id}")
                             ec2_node_id = f"ec2-{ec2_id}-in-{group_key}"
                             resources[ec2_node_id] = {"Type": "AWS::EC2::Instance", "Title": ec2_id}
 
                             # Wrap in SGs if present
                             ec2_res = self.view.filtered_resources.get(ec2_id)
+                            if ec2_res:
+                                logger.debug(f"Found EC2 resource for {ec2_id}: {ec2_res.name}")
+                            else:
+                                logger.debug(f"No EC2 resource found for {ec2_id} in filtered resources")
                             ec2_wrapped = ec2_node_id
                             if ec2_res and ec2_res.properties.get('security_group_ids'):
                                 sgs = ec2_res.properties.get('security_group_ids', [])
@@ -944,13 +951,20 @@ class AWSLabsTransformer:
 
                         for target in ip_targets:
                             ip, port = self._parse_ip_target(target)
+                            logger.debug(f"Processing IP target {ip}:{port}")
 
                             # Check if this IP maps to a known service already included
                             mapped_svc = self._find_service_id_by_ip(ip)
-                            if mapped_svc and mapped_svc in self._group_parent:
-                                # Skip this IP - the service is already rendered in the diagram
-                                logger.debug(f"Skipping IP {ip} - maps to service {mapped_svc} already included")
-                                continue
+                            if mapped_svc:
+                                logger.debug(f"IP {ip} maps to service {mapped_svc}")
+                                if mapped_svc in self._group_parent:
+                                    # Skip this IP - the service is already rendered in the diagram somewhere
+                                    logger.debug(f"Skipping IP {ip} - service {mapped_svc} already handled (parent: {self._group_parent[mapped_svc]})")
+                                    continue
+                                else:
+                                    logger.debug(f"IP {ip} maps to service {mapped_svc} but service not in group_parent - will render IP")
+                            else:
+                                logger.debug(f"IP {ip} does not map to any known service - will render IP")
 
                             ip_node_id = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
                             if ip_node_id not in resources:
