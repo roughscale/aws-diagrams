@@ -154,8 +154,7 @@ class BaseTransformer(ABC):
             resource_type=resource.resource_type
         )
 
-        # Apply resource-specific styling
-        node.style = self._get_resource_style(resource.resource_type)
+        # No styling applied - let individual transformers handle format-specific styling
 
         return node
 
@@ -186,22 +185,6 @@ class BaseTransformer(ABC):
 
         return False
 
-    def _get_resource_style(self, resource_type: ResourceType) -> Style:
-        """Get default styling for a resource type."""
-        # Default AWS color scheme
-        aws_colors = {
-            ResourceType.VPC: Style(fill_color="#FF9900", border_color="#FF6600"),
-            ResourceType.SUBNET: Style(fill_color="#7AA116", border_color="#5A7D0F"),
-            ResourceType.SECURITY_GROUP: Style(fill_color="#FF4B4B", border_color="#CC0000"),
-            ResourceType.EC2_INSTANCE: Style(fill_color="#FF9900", border_color="#CC6600"),
-            ResourceType.LOAD_BALANCER: Style(fill_color="#9D5025", border_color="#7A3E1C"),
-            ResourceType.RDS_INSTANCE: Style(fill_color="#3F48CC", border_color="#2E3799"),
-            ResourceType.LAMBDA_FUNCTION: Style(fill_color="#FF9900", border_color="#CC6600"),
-            ResourceType.ECS_CLUSTER: Style(fill_color="#FF9900", border_color="#CC6600"),
-            ResourceType.ECS_SERVICE: Style(fill_color="#FF9900", border_color="#CC6600")
-        }
-
-        return aws_colors.get(resource_type, Style(fill_color="#CCCCCC", border_color="#999999"))
 
     def _create_containers(self) -> None:
         """Create hierarchical containers (VPCs, subnets, clusters)."""
@@ -233,12 +216,7 @@ class BaseTransformer(ABC):
                     "resource_id": resource_id,
                     "cidr_blocks": getattr(resource, 'cidr_blocks', [])
                 },
-                layout_type=LayoutType.FREE_FORM,
-                style=Style(
-                    fill_color="rgba(255, 153, 0, 0.1)",
-                    border_color="#FF9900",
-                    border_width=2.0
-                )
+                layout_type=LayoutType.FREE_FORM
             )
 
             # Find all resources in this VPC that exist as nodes in the graph
@@ -296,12 +274,7 @@ class BaseTransformer(ABC):
                         "group_name": group_name,
                         "subnet_ids": subnet_ids
                     },
-                    layout_type=LayoutType.VERTICAL_STACK,
-                    style=Style(
-                        fill_color=self._get_subnet_group_styling(group_name),
-                        border_color="#7AA116",
-                        border_width=1.0
-                    )
+                    layout_type=LayoutType.VERTICAL_STACK
                 )
 
                 # Place services in logical subnets based on AWS architectural patterns
@@ -359,16 +332,6 @@ class BaseTransformer(ABC):
                     return '-'.join(parts[:-1]) + '-subnets' if len(parts) > 1 else subnet_name
             return 'misc-subnets'
 
-    def _get_subnet_group_styling(self, group_name: str) -> str:
-        """Get styling color for subnet group based on type."""
-        color_map = {
-            'public-subnets': "rgba(122, 161, 22, 0.15)",  # Green for public
-            'private-subnets': "rgba(255, 153, 0, 0.15)",  # Orange for private
-            'database-subnets': "rgba(54, 99, 136, 0.15)", # Blue for database
-            'web-subnets': "rgba(255, 75, 75, 0.15)",      # Red for web
-            'app-subnets': "rgba(153, 102, 255, 0.15)",    # Purple for app
-        }
-        return color_map.get(group_name, "rgba(122, 161, 22, 0.15)")
 
     def _collect_target_group_lambda_targets(self) -> Set[str]:
         """Collect Lambda function IDs that are targets of target groups to prevent multi-parenting."""
@@ -540,11 +503,7 @@ class BaseTransformer(ABC):
                 id=sg_container_id,
                 label=f"SG: {sg_name}",
                 container_type="security_group",
-                layout_type=LayoutType.FREE_FORM,
-                style=Style(
-                    fill_color="rgba(255,244,230,25)",
-                    border_color="rgba(255,140,0,200)"
-                )
+                layout_type=LayoutType.FREE_FORM
             )
             sg_container.add_child(current_container)
             self.graph.add_container(sg_container)
@@ -653,12 +612,7 @@ class BaseTransformer(ABC):
                         "cluster_arn": cluster_arn,
                         "service_count": len(services)
                     },
-                    layout_type=LayoutType.VERTICAL_STACK,
-                    style=Style(
-                        fill_color="rgba(255, 153, 0, 0.1)",
-                        border_color="#FF9900",
-                        border_width=1.5
-                    )
+                    layout_type=LayoutType.VERTICAL_STACK
                 )
 
                 for service_id in services:
@@ -698,23 +652,10 @@ class BaseTransformer(ABC):
             relationship_type=relationship.relationship_type.value
         )
 
-        # Style edges based on relationship type
-        edge.style = self._get_edge_style(relationship.relationship_type)
+        # No styling applied - let individual transformers handle format-specific styling
 
         return edge
 
-    def _get_edge_style(self, relationship_type: RelationshipType) -> Style:
-        """Get styling for an edge based on relationship type."""
-        edge_styles = {
-            RelationshipType.CONTAINS: Style(color="#666666", dashed=False),
-            RelationshipType.ATTACHED_TO: Style(color="#0066CC", dashed=False),
-            RelationshipType.ROUTES_TO: Style(color="#009900", dashed=True),
-            RelationshipType.ALLOWS: Style(color="#FF6600", dashed=True),
-            RelationshipType.TARGETS: Style(color="#CC0000", dashed=False),
-            RelationshipType.CONNECTS_TO: Style(color="#9900CC", dashed=False)
-        }
-
-        return edge_styles.get(relationship_type, Style(color="#CCCCCC"))
 
     def _optimize_layout(self) -> None:
         """Apply layout optimizations to the graph."""

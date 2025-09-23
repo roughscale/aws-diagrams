@@ -222,12 +222,7 @@ class AWSLabsTransformerV2(BaseTransformer):
             # ECS resources don't render as standalone nodes in service-centric layout
             pass
 
-        # Apply custom styling from node
-        if node.style:
-            if node.style.fill_color:
-                resource["FillColor"] = node.style.fill_color
-            if node.style.border_color:
-                resource["BorderColor"] = node.style.border_color
+        # Custom styling removed - all styling now handled by transformer-specific logic above
 
     def _apply_awslabs_layout(self, resources: Dict[str, Any]) -> None:
         """Apply AWS Labs specific layout logic."""
