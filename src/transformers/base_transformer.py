@@ -453,7 +453,11 @@ class BaseTransformer(ABC):
                 cluster_info = ecs_service_clusters[service_ids[0]]
                 cluster_resource = cluster_info['cluster_resource']
 
-                cluster_container_id = f"ecs-cluster-{cluster_resource.resource_id}-in-{container.id}"
+                # Use V1-style cluster ID pattern for consistency
+                cluster_name = cluster_resource.name or cluster_resource.resource_id.split('/')[-1]
+                vpc_id = container.properties.get('vpc_id', 'unknown')
+                group_name = container.properties.get('group_name', 'unknown')
+                cluster_container_id = f"cluster-{cluster_name}-in-{vpc_id}-{group_name}"
 
                 # Group services by security groups for de-duplication
                 services_by_sg = self._group_ecs_services_by_security_groups(service_ids)

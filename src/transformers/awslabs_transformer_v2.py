@@ -92,8 +92,18 @@ class AWSLabsTransformerV2(BaseTransformer):
         # Handle layout and grouping
         self._apply_awslabs_layout(resources)
 
-        # Create the final diagram structure
-        return {"Diagram": {"Resources": resources}}
+        # Create the final diagram structure with definition files
+        return {
+            "Diagram": {
+                "DefinitionFiles": [
+                    {
+                        "Type": "URL",
+                        "Url": "https://raw.githubusercontent.com/awslabs/diagram-as-code/main/definitions/definition-for-aws-icons-light.yaml"
+                    }
+                ],
+                "Resources": resources
+            }
+        }
 
     def _create_base_structure(self) -> Dict[str, Any]:
         """Create the base Canvas and Cloud structure."""
@@ -426,29 +436,14 @@ class AWSLabsTransformerV2(BaseTransformer):
 
     def _should_skip_awslabs_resource(self, node: GraphNode) -> bool:
         """
-        Apply aggressive filtering to only include DAC-supported resource types.
+        Apply filtering for AWS Labs architectural patterns.
 
-        DAC only supports a limited set of AWS resource types. All others must be filtered out
-        to prevent warnings and unknown resource errors.
+        This implements the same filtering logic as the original transformer
+        to maintain architectural consistency and avoid rendering conflicts.
         """
         if not node.resource_type:
             return True
 
-        # ONLY include these DAC-supported resource types (from working examples)
-        dac_supported_types = {
-            ResourceType.VPC,
-            ResourceType.SUBNET,
-            ResourceType.INTERNET_GATEWAY,
-            ResourceType.NAT_GATEWAY,
-            ResourceType.EC2_INSTANCE,
-            ResourceType.LOAD_BALANCER,  # AWS::ElasticLoadBalancingV2::LoadBalancer
-        }
-
-        # Skip all resources that are not explicitly supported by DAC
-        if node.resource_type not in dac_supported_types:
-            return True
-
-        # Additional filtering for specific architectural cases
         # Skip subnets when logical grouping is enabled (they become containers)
         logical_subnets_enabled = getattr(self, 'logical_subnets_enabled', True)
         if node.resource_type == ResourceType.SUBNET and logical_subnets_enabled:
@@ -458,6 +453,16 @@ class AWSLabsTransformerV2(BaseTransformer):
         if node.resource_type == ResourceType.LOAD_BALANCER:
             return True
 
+        # Skip target groups as standalone nodes (not user-visible components)
+        if node.resource_type == ResourceType.TARGET_GROUP:
+            return True
+
+        # Skip ECS services that have target groups (handled by LB/TG clustering)
+        if node.resource_type == ResourceType.ECS_SERVICE:
+            has_tgs = bool(node.properties.get('target_group_arns'))
+            if has_tgs:
+                return True
+
         return False
 
     def _filter_container_children(self, resources: Dict[str, Any]) -> None:
@@ -465,15 +470,26 @@ class AWSLabsTransformerV2(BaseTransformer):
         # Get the set of resource IDs that will be included in the final output
         included_resource_ids = set(resources.keys())
 
-        # Update container children lists
+        # Update container children lists recursively
         for container_id, container_resource in resources.items():
             if "Children" in container_resource and container_resource["Children"]:
                 # Filter children to only include resources that exist in the output
+                original_children = container_resource["Children"][:]
                 filtered_children = [
                     child_id for child_id in container_resource["Children"]
                     if child_id in included_resource_ids
                 ]
+
+                # Log missing children for debugging
+                if len(filtered_children) != len(original_children):
+                    missing_children = set(original_children) - set(filtered_children)
+                    logger.debug(f"Container {container_id} references missing children: {missing_children}")
+
                 container_resource["Children"] = filtered_children
+
+                # If container has no children after filtering, it may be invalid
+                if not filtered_children and original_children:
+                    logger.warning(f"Container {container_id} has no valid children after filtering")
 
     def _handle_load_balancers_in_subnet(self, resources: Dict[str, Any], subnet_container: GraphContainer) -> None:
         """Handle load balancer organization within logical subnets."""
