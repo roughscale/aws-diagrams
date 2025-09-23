@@ -1136,6 +1136,10 @@ class AWSLabsTransformer:
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in resources:  # Skip if already added
                 continue
+
+            # Skip resources that have been assigned to a parent by logical subnet grouping
+            if resource_id in self._group_parent:
+                continue
                 
             service_type = self.RESOURCE_TYPE_MAPPING.get(
                 resource.resource_type, 
