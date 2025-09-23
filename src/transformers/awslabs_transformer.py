@@ -1466,6 +1466,25 @@ class AWSLabsTransformer:
                 return rel.target_id
         return None
 
+    def _parse_ip_target(self, target: dict) -> tuple[str, Optional[int]]:
+        """Parse target dict to extract IP and port.
+
+        Args:
+            target: Target dict with 'id' and optional 'port' keys
+
+        Returns:
+            Tuple of (ip_address, port) where port can be None
+        """
+        tid = target.get('id', '')
+        port = target.get('port')
+
+        # Handle IP addresses (both IPv4 and IPv6)
+        if '.' in str(tid) or ':' in str(tid):
+            return str(tid), port
+
+        # Fallback for other formats
+        return str(tid), port
+
     def _get_vpce_service_id(self, service_name: str) -> Optional[str]:
         """Extract the vpce service id (vpce-svc-*) from a full service name."""
         if not service_name:
