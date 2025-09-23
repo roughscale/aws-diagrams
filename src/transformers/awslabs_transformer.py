@@ -546,10 +546,18 @@ class AWSLabsTransformer:
 
             # Step 1: Collect ECS clusters and services (for future clustering)
             ecs_clusters_in_subnet = {}  # cluster_arn -> {cluster_resource, services: []}
+            ecs_services_found = 0
+            ecs_services_with_clusters = 0
+
             for rid, res in self.view.filtered_resources.items():
                 if res.resource_type == ResourceType.ECS_SERVICE:
+                    ecs_services_found += 1
                     cluster_arn = res.properties.get('clusterArn')  # Note: property name from collector
                     service_subnets = set(res.properties.get('subnet_ids') or [])
+
+                    # Debug: Check if service has cluster ARN
+                    if cluster_arn:
+                        ecs_services_with_clusters += 1
 
                     # Only collect services that are in this logical subnet
                     if cluster_arn and service_subnets & subnet_set:
@@ -569,9 +577,12 @@ class AWSLabsTransformer:
                                 }
                             ecs_clusters_in_subnet[cluster_arn]['services'].append(rid)
 
-            # For now, just log what we collected (will be removed later)
+            # Debug logging
+            logger.debug(f"Found {ecs_services_found} ECS services total, {ecs_services_with_clusters} with cluster ARNs")
             if ecs_clusters_in_subnet:
-                logger.info(f"Collected {len(ecs_clusters_in_subnet)} ECS clusters in {group_node_id} with total {sum(len(data['services']) for data in ecs_clusters_in_subnet.values())} services")
+                logger.debug(f"Collected {len(ecs_clusters_in_subnet)} ECS clusters in {group_node_id} with total {sum(len(data['services']) for data in ecs_clusters_in_subnet.values())} services")
+            else:
+                logger.debug(f"No ECS clusters collected for {group_node_id}")
 
             for rid, res in self.view.filtered_resources.items():
                 if res.resource_type == ResourceType.ECS_SERVICE:
