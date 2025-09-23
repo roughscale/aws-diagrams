@@ -543,7 +543,7 @@ def generate(ctx):
 )
 @click.option(
     '--format',
-    type=click.Choice(['awslabs', 'd2', 'plantuml'], case_sensitive=False),
+    type=click.Choice(['awslabs', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
     default='awslabs',
     help='Diagram format'
 )
@@ -563,11 +563,11 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
         except ImportError:
             from topology.serializer import TopologyYAMLSerializer
         from ..views import ViewEngine
-        from ..transformers import AWSLabsTransformer
+        from ..transformers import AWSLabsTransformer, DrawioTransformer
     except ImportError:
         from topology.serializer import TopologyYAMLSerializer
         from views import ViewEngine
-        from transformers import AWSLabsTransformer
+        from transformers import AWSLabsTransformer, DrawioTransformer
     from pathlib import Path
     
     topology_path = Path(topology)
@@ -597,6 +597,10 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
             transformer = AWSLabsTransformer(view)
             transformer.save_to_file(output)
             logger.info(f"AWS Labs diagram saved to {output}")
+        elif format.lower() == 'drawio':
+            transformer = DrawioTransformer(view)
+            transformer.save_to_file(output)
+            logger.info(f"Draw.io diagram saved to {output}")
         else:
             logger.error(f"Format {format} not yet implemented")
             sys.exit(1)
@@ -621,7 +625,7 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
 )
 @click.option(
     '--format',
-    type=click.Choice(['awslabs', 'd2', 'plantuml'], case_sensitive=False),
+    type=click.Choice(['awslabs', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
     default='awslabs',
     help='Diagram format'
 )
