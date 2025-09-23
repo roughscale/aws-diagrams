@@ -142,7 +142,7 @@ class AWSLabsTransformerV2(BaseTransformer):
         elif container.container_type == "logical_subnet":
             preset = "PublicSubnet" if "public" in container.label.lower() else "PrivateSubnet"
             return {
-                "Type": "AWS::Diagram::LogicalSubnet",
+                "Type": "AWS::EC2::Subnet",
                 "Title": container.label,
                 "Preset": preset,
                 "Children": container.children_ids
