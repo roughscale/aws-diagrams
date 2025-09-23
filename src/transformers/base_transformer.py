@@ -191,20 +191,20 @@ class BaseTransformer(ABC):
         """Create hierarchical containers (VPCs, subnets, clusters)."""
         logger.debug("Creating hierarchical containers")
 
-        # Create VPC containers
-        self._create_vpc_containers()
-
-        # Create subnet containers if logical subnets are enabled
+        # Create subnet containers first (logical subnets need to exist before VPC containers)
         if self.logical_subnets_enabled:
             self._create_logical_subnet_containers()
         else:
             self._create_physical_subnet_containers()
 
+        # Create VPC containers (these will reference logical subnet containers)
+        self._create_vpc_containers()
+
         # Create ECS cluster containers
         self._create_ecs_cluster_containers()
 
     def _create_vpc_containers(self) -> None:
-        """Create VPC containers."""
+        """Create VPC containers with logical subnet organization."""
         for resource_id, resource in self.view.filtered_resources.items():
             if resource.resource_type != ResourceType.VPC:
                 continue
@@ -217,15 +217,28 @@ class BaseTransformer(ABC):
                     "resource_id": resource_id,
                     "cidr_blocks": getattr(resource, 'cidr_blocks', [])
                 },
-                layout_type=LayoutType.FREE_FORM
+                layout_type=LayoutType.VERTICAL_STACK  # Changed to vertical stack
             )
 
-            # Find all resources in this VPC that exist as nodes in the graph
+            # Find logical subnet containers for this VPC
+            logical_subnet_containers = []
+            for container_id, logical_container in self.graph.containers.items():
+                if (logical_container.container_type == "logical_subnet" and
+                    logical_container.properties.get('vpc_id') == resource_id):
+                    logical_subnet_containers.append(container_id)
+
+            # Add logical subnet containers to VPC
+            for logical_subnet_id in logical_subnet_containers:
+                container.add_child(logical_subnet_id)
+
+            # Add any VPC-level resources that aren't part of logical subnets
+            # (like NAT gateways, internet gateways, etc.)
             for res_id, res in self.view.filtered_resources.items():
                 if (hasattr(res, 'properties') and
                     res.properties.get('vpc_id') == resource_id and
                     res_id != resource_id and
-                    res_id in self.graph.nodes):  # Ensure child node exists
+                    res_id in self.graph.nodes and
+                    not self._is_resource_in_logical_subnet(res_id)):
                     container.add_child(res_id)
 
             self.graph.add_container(container)
@@ -601,6 +614,30 @@ class BaseTransformer(ABC):
                             network_resource_ids.append(resource_id)
 
         return network_resource_ids
+
+    def _is_resource_in_logical_subnet(self, resource_id: str) -> bool:
+        """Check if a resource is already included in a logical subnet container."""
+        resource = self.view.filtered_resources.get(resource_id)
+        if not resource:
+            return False
+
+        # Check if resource is included in any logical subnet container
+        for container in self.graph.containers.values():
+            if container.container_type == "logical_subnet":
+                if self._resource_belongs_to_logical_subnet(resource, container):
+                    return True
+
+        return False
+
+    def _resource_belongs_to_logical_subnet(self, resource: BaseResource, logical_container: GraphContainer) -> bool:
+        """Check if a resource belongs to a specific logical subnet container."""
+        subnet_ids = logical_container.properties.get('subnet_ids', [])
+        if not subnet_ids:
+            return False
+
+        # Check if resource is in any of the logical subnet's physical subnets
+        resource_subnets = set(resource.properties.get('subnet_ids', []))
+        return bool(resource_subnets & set(subnet_ids))
 
     def _create_service_grid(self, grid_container_id: str, service_ids: List[str]) -> str:
         """Create a grid layout for services following V1 pattern."""

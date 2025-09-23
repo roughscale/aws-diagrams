@@ -132,13 +132,21 @@ class AWSLabsTransformerV2(BaseTransformer):
     def _container_to_awslabs_resource(self, container: GraphContainer) -> Optional[Dict[str, Any]]:
         """Convert a graph container to AWS Labs resource format."""
         if container.container_type == "vpc":
-            return {
+            vpc_resource = {
                 "Type": "AWS::EC2::VPC",
                 "Title": container.label,
                 "Children": container.children_ids,
                 "FillColor": "rgba(255,153,0,25)",
                 "BorderColor": "rgba(255,153,0,200)"
             }
+
+            # Add direction based on layout type
+            if container.layout_type == LayoutType.VERTICAL_STACK:
+                vpc_resource["Direction"] = "vertical"
+            elif container.layout_type == LayoutType.HORIZONTAL_STACK:
+                vpc_resource["Direction"] = "horizontal"
+
+            return vpc_resource
         elif container.container_type == "logical_subnet":
             preset = "PublicSubnet" if "public" in container.label.lower() else "PrivateSubnet"
             return {
