@@ -560,36 +560,24 @@ class AWSLabsTransformer:
                     # Debug: Check if service has cluster ARN
                     if cluster_arn:
                         ecs_services_with_clusters += 1
-                        logger.debug(f"Service {res.name} has cluster ARN: {cluster_arn}")
-                        logger.debug(f"Service subnets: {service_subnets}, logical subnet set: {subnet_set}")
-                        if not (service_subnets & subnet_set):
-                            logger.debug(f"Service {res.name} not in current logical subnet group")
 
                     # Only collect services that are in this logical subnet
                     if cluster_arn and service_subnets & subnet_set:
-                        logger.debug(f"Processing service {res.name} for clustering")
                         # Find the cluster resource
                         cluster_resource = None
-                        cluster_resources_found = []
                         for crid, cres in self.view.filtered_resources.items():
-                            if cres.resource_type == ResourceType.ECS_CLUSTER:
-                                cluster_resources_found.append(cres.resource_id)
                             if (cres.resource_type == ResourceType.ECS_CLUSTER and
                                 cres.resource_id == cluster_arn):
                                 cluster_resource = cres
                                 break
 
                         if cluster_resource:
-                            logger.debug(f"Found matching cluster resource for {res.name}")
                             if cluster_arn not in ecs_clusters_in_subnet:
                                 ecs_clusters_in_subnet[cluster_arn] = {
                                     'cluster_resource': cluster_resource,
                                     'services': []
                                 }
                             ecs_clusters_in_subnet[cluster_arn]['services'].append(rid)
-                        else:
-                            logger.debug(f"No cluster resource found for {res.name} with ARN {cluster_arn}")
-                            logger.debug(f"Available cluster resources: {cluster_resources_found[:5]}...")  # Show first 5
 
             # Debug logging
             logger.debug(f"Found {ecs_services_found} ECS services total, {ecs_services_with_clusters} with cluster ARNs")
@@ -597,6 +585,9 @@ class AWSLabsTransformer:
                 logger.debug(f"Collected {len(ecs_clusters_in_subnet)} ECS clusters in {group_node_id} with total {sum(len(data['services']) for data in ecs_clusters_in_subnet.values())} services")
             else:
                 logger.debug(f"No ECS clusters collected for {group_node_id}")
+
+            # Step 2: Store ECS cluster data for creating clusters under LBs later
+            # We'll create clusters as children of LBs only when LB targets services in that cluster
 
             for rid, res in self.view.filtered_resources.items():
                 if res.resource_type == ResourceType.ECS_SERVICE:
@@ -679,13 +670,66 @@ class AWSLabsTransformer:
                         if svc.resource_type == ResourceType.ECS_SERVICE:
                             tgs = set(svc.properties.get('target_group_arns') or [])
                             if tg_id in tgs:
-                                child_id = f"ecs-{svc_id}-in-{group_key}"
-                                # Check if this ECS service is already placed elsewhere to prevent cycles
-                                if child_id not in resources and svc_id not in self._group_parent:
-                                    resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
-                                    # Mark this ECS service as owned by a target group to prevent duplicate placement
-                                    self._group_parent[svc_id] = f"tg-owned-{tg_id}"
-                                    svc_grand_children.append(child_id)
+                                # Check if this service belongs to an ECS cluster
+                                cluster_arn = svc.properties.get('clusterArn')
+                                cluster_data = ecs_clusters_in_subnet.get(cluster_arn) if cluster_arn else None
+
+                                if cluster_data:
+                                    # Service belongs to a cluster - create cluster hierarchy
+                                    cluster_resource = cluster_data['cluster_resource']
+                                    cluster_node_id = f"cluster-{cluster_resource.name}-tg-{tg_id}-in-{group_key}"
+
+                                    # Create cluster node if not already created for this TG
+                                    if cluster_node_id not in resources:
+                                        resources[cluster_node_id] = {
+                                            "Type": "AWS::ECS::Cluster",
+                                            "Title": cluster_resource.name or cluster_resource.resource_id.split('/')[-1],
+                                            "Children": []
+                                        }
+                                        svc_grand_children.append(cluster_node_id)
+                                        logger.debug(f"Created ECS cluster {cluster_node_id} under TG {tg_id}")
+
+                                    # Create ECS service with security group wrapping as child of cluster
+                                    if svc_id not in self._group_parent:
+                                        service_node_id = f"ecs-{svc_id}-in-{cluster_node_id}"
+
+                                        # Create the base ECS service node
+                                        resources[service_node_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
+
+                                        # Wrap in security group containers if service has SGs
+                                        sgs = svc.properties.get('security_group_ids', [])
+                                        current_container = service_node_id
+
+                                        if sgs:
+                                            # Wrap in security group containers (innermost to outermost)
+                                            for sg_id in reversed(sgs):
+                                                sg_container_id = f"sg-{sg_id}-container-ecs-{svc_id}-in-{cluster_node_id}"
+                                                sg_res = self.view.filtered_resources.get(sg_id)
+                                                sg_name = None
+                                                if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                                                    sg_name = sg_res.name or sg_res.properties.get('group_name')
+
+                                                resources[sg_container_id] = {
+                                                    "Type": "AWS::EC2::SecurityGroup",
+                                                    "Title": f"SG: {sg_name or sg_id}",
+                                                    "Children": [current_container],
+                                                    "FillColor": "rgba(255,244,230,25)",  # Light orange background
+                                                    "BorderColor": "rgba(255,140,0,200)"  # Orange border
+                                                }
+                                                current_container = sg_container_id
+
+                                        # Add the final container (service or outermost SG) to cluster
+                                        resources[cluster_node_id]["Children"].append(current_container)
+                                        self._group_parent[svc_id] = f"cluster-owned-{cluster_node_id}"
+                                        logger.debug(f"Added ECS service {svc.name} with SG wrapping to cluster {cluster_node_id}")
+                                else:
+                                    # Service not in cluster - add directly to TG as before
+                                    child_id = f"ecs-{svc_id}-in-{group_key}"
+                                    if child_id not in resources and svc_id not in self._group_parent:
+                                        resources[child_id] = {"Type": "AWS::ECS::Service", "Title": svc.name or svc_id}
+                                        self._group_parent[svc_id] = f"tg-owned-{tg_id}"
+                                        svc_grand_children.append(child_id)
+
                                 # Always collect subnets for placement regardless of whether we create the node
                                 for s in (svc.properties or {}).get('subnet_ids') or []:
                                     target_subnets.append(s)
