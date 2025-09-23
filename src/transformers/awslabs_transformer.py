@@ -544,6 +544,35 @@ class AWSLabsTransformer:
             lb_children: List[str] = []
             subnet_set = set(subnet_ids)
 
+            # Step 1: Collect ECS clusters and services (for future clustering)
+            ecs_clusters_in_subnet = {}  # cluster_arn -> {cluster_resource, services: []}
+            for rid, res in self.view.filtered_resources.items():
+                if res.resource_type == ResourceType.ECS_SERVICE:
+                    cluster_arn = res.properties.get('clusterArn')  # Note: property name from collector
+                    service_subnets = set(res.properties.get('subnet_ids') or [])
+
+                    # Only collect services that are in this logical subnet
+                    if cluster_arn and service_subnets & subnet_set:
+                        # Find the cluster resource
+                        cluster_resource = None
+                        for crid, cres in self.view.filtered_resources.items():
+                            if (cres.resource_type == ResourceType.ECS_CLUSTER and
+                                cres.resource_id == cluster_arn):
+                                cluster_resource = cres
+                                break
+
+                        if cluster_resource:
+                            if cluster_arn not in ecs_clusters_in_subnet:
+                                ecs_clusters_in_subnet[cluster_arn] = {
+                                    'cluster_resource': cluster_resource,
+                                    'services': []
+                                }
+                            ecs_clusters_in_subnet[cluster_arn]['services'].append(rid)
+
+            # For now, just log what we collected (will be removed later)
+            if ecs_clusters_in_subnet:
+                logger.info(f"Collected {len(ecs_clusters_in_subnet)} ECS clusters in {group_node_id} with total {sum(len(data['services']) for data in ecs_clusters_in_subnet.values())} services")
+
             for rid, res in self.view.filtered_resources.items():
                 if res.resource_type == ResourceType.ECS_SERVICE:
                     subnets = set(res.properties.get('subnet_ids') or [])
