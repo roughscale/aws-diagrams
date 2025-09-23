@@ -543,9 +543,9 @@ def generate(ctx):
 )
 @click.option(
     '--format',
-    type=click.Choice(['awslabs', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
+    type=click.Choice(['awslabs', 'awslabs-v2', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
     default='awslabs',
-    help='Diagram format'
+    help='Diagram format (awslabs-v2 uses new generic graph model)'
 )
 @click.pass_context
 def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[str], 
@@ -563,11 +563,11 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
         except ImportError:
             from topology.serializer import TopologyYAMLSerializer
         from ..views import ViewEngine
-        from ..transformers import AWSLabsTransformer, DrawioTransformer
+        from ..transformers import AWSLabsTransformer, AWSLabsTransformerV2, DrawioTransformer
     except ImportError:
         from topology.serializer import TopologyYAMLSerializer
         from views import ViewEngine
-        from transformers import AWSLabsTransformer, DrawioTransformer
+        from transformers import AWSLabsTransformer, AWSLabsTransformerV2, DrawioTransformer
     from pathlib import Path
     
     topology_path = Path(topology)
@@ -597,6 +597,10 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
             transformer = AWSLabsTransformer(view)
             transformer.save_to_file(output)
             logger.info(f"AWS Labs diagram saved to {output}")
+        elif format.lower() == 'awslabs-v2':
+            transformer = AWSLabsTransformerV2(view)
+            transformer.save_to_file(output)
+            logger.info(f"AWS Labs V2 diagram (using generic graph model) saved to {output}")
         elif format.lower() == 'drawio':
             transformer = DrawioTransformer(view)
             transformer.save_to_file(output)
@@ -625,9 +629,9 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
 )
 @click.option(
     '--format',
-    type=click.Choice(['awslabs', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
+    type=click.Choice(['awslabs', 'awslabs-v2', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
     default='awslabs',
-    help='Diagram format'
+    help='Diagram format (awslabs-v2 uses new generic graph model)'
 )
 @click.pass_context
 def generate_cross_account_diagram(ctx, topology: str, output: str, format: str):
