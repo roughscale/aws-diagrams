@@ -128,6 +128,11 @@ class BaseTransformer(ABC):
             if resource_id in self._processed_resources:
                 continue
 
+            # Apply AWS Labs filtering logic to maintain consistency across all formats
+            if self._should_skip_resource_node(resource):
+                logger.debug(f"Skipping resource node {resource_id} ({resource.resource_type})")
+                continue
+
             node = self._create_node_from_resource(resource)
             self.graph.add_node(node)
             self._processed_resources.add(resource_id)
@@ -157,6 +162,33 @@ class BaseTransformer(ABC):
         node.style = self._get_resource_style(resource.resource_type)
 
         return node
+
+    def _should_skip_resource_node(self, resource: BaseResource) -> bool:
+        """
+        Determine if a resource should be skipped as a standalone node.
+
+        This implements the AWS Labs filtering logic to maintain consistency
+        across all output formats (AWS Labs, draw.io, etc.).
+        """
+        # Skip subnets when logical grouping is enabled (they become containers)
+        if resource.resource_type == ResourceType.SUBNET and self.logical_subnets_enabled:
+            return True
+
+        # Skip load balancers as standalone nodes (handled by logical subnet stacks)
+        if resource.resource_type == ResourceType.LOAD_BALANCER:
+            return True
+
+        # Skip target groups as standalone nodes (not user-visible components)
+        if resource.resource_type == ResourceType.TARGET_GROUP:
+            return True
+
+        # Skip ECS services that have target groups (handled by LB/TG clustering)
+        if resource.resource_type == ResourceType.ECS_SERVICE:
+            has_tgs = bool(resource.properties.get('target_group_arns'))
+            if has_tgs:
+                return True
+
+        return False
 
     def _get_resource_style(self, resource_type: ResourceType) -> Style:
         """Get default styling for a resource type."""
@@ -213,11 +245,12 @@ class BaseTransformer(ABC):
                 )
             )
 
-            # Find all resources in this VPC
+            # Find all resources in this VPC that exist as nodes in the graph
             for res_id, res in self.view.filtered_resources.items():
                 if (hasattr(res, 'properties') and
                     res.properties.get('vpc_id') == resource_id and
-                    res_id != resource_id):
+                    res_id != resource_id and
+                    res_id in self.graph.nodes):  # Ensure child node exists
                     container.add_child(res_id)
 
             self.graph.add_container(container)
@@ -269,10 +302,11 @@ class BaseTransformer(ABC):
                     )
                 )
 
-                # Find resources in these subnets
+                # Find resources in these subnets that exist as nodes in the graph
                 for res_id, res in self.view.filtered_resources.items():
                     if (hasattr(res, 'properties') and
-                        res.properties.get('subnet_ids')):
+                        res.properties.get('subnet_ids') and
+                        res_id in self.graph.nodes):  # Ensure child node exists
                         res_subnets = set(res.properties.get('subnet_ids', []))
                         if res_subnets & set(subnet_ids):
                             container.add_child(res_id)
@@ -328,27 +362,35 @@ class BaseTransformer(ABC):
         """Create ECS cluster containers with service groupings."""
         logger.debug("Creating ECS cluster containers")
 
-        # Find all ECS clusters
-        clusters = {rid: res for rid, res in self.view.filtered_resources.items()
-                   if res.resource_type == ResourceType.ECS_CLUSTER}
+        # Find all ECS clusters that should be rendered as nodes
+        clusters = {}
+        for rid, res in self.view.filtered_resources.items():
+            if (res.resource_type == ResourceType.ECS_CLUSTER and
+                not self._should_skip_resource_node(res) and
+                rid in self.graph.nodes):  # Ensure cluster node exists
+                clusters[rid] = res
 
         for cluster_id, cluster_resource in clusters.items():
-            # Find services in this cluster
+            # Find services in this cluster that aren't skipped
             cluster_arn = cluster_resource.resource_id
             services = []
 
             for svc_id, svc_res in self.view.filtered_resources.items():
                 if (svc_res.resource_type == ResourceType.ECS_SERVICE and
                     svc_res.properties.get('clusterArn') == cluster_arn):
-                    services.append(svc_id)
+                    # Only include services that won't be skipped as nodes AND exist in graph
+                    if (not self._should_skip_resource_node(svc_res) and
+                        svc_id in self.graph.nodes):
+                        services.append(svc_id)
 
-            if services:  # Only create container if there are services
+            if services:  # Only create container if there are services that will be rendered
                 container = GraphContainer(
                     id=f"ecs-cluster-container-{cluster_id}",
                     label=cluster_resource.name or cluster_id,
                     container_type="ecs_cluster",
                     properties={
                         "resource_id": cluster_id,
+                        "cluster_arn": cluster_arn,
                         "service_count": len(services)
                     },
                     layout_type=LayoutType.VERTICAL_STACK,
@@ -361,8 +403,13 @@ class BaseTransformer(ABC):
 
                 for service_id in services:
                     container.add_child(service_id)
+                    # Mark services as grouped to avoid processing them elsewhere
+                    self._group_parent[service_id] = container.id
 
                 self.graph.add_container(container)
+                logger.debug(f"Created ECS cluster container {container.id} with {len(services)} services")
+            else:
+                logger.debug(f"Skipping ECS cluster {cluster_id} - no valid services to render")
 
     def _create_edges(self) -> None:
         """Create edges from topology relationships."""

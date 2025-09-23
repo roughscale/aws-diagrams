@@ -32,7 +32,7 @@ class AWSLabsTransformerV2(BaseTransformer):
     conversion logic and focuses on AWS Labs specific output formatting.
     """
 
-    # AWS Labs specific type mapping
+    # AWS Labs specific type mapping (matches original transformer exactly)
     AWSLABS_TYPE_MAPPING = {
         ResourceType.VPC: "AWS::EC2::VPC",
         ResourceType.SUBNET: "AWS::EC2::Subnet",
