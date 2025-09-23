@@ -534,6 +534,49 @@ class AWSLabsTransformer:
                     if t.get('id'):
                         tg_lambda_target_ids.add(str(t['id']))
 
+        # Global ECS service tracking: precompute which ECS services will be in cluster hierarchies
+        # This prevents cross-subnet IP duplication where LB is in different subnet than ECS services
+        global_ecs_service_tracking = {}  # service_id -> cluster_info for all ECS services
+        all_subnet_ids_in_vpc = []
+        for subnet_list in group_to_subnets.values():
+            all_subnet_ids_in_vpc.extend(subnet_list)
+        vpc_subnet_set = set(all_subnet_ids_in_vpc)
+
+        for svc_id, svc in self.view.filtered_resources.items():
+            if svc.resource_type == ResourceType.ECS_SERVICE:
+                svc_subnets = set(svc.properties.get('subnet_ids') or [])
+                if svc_subnets & vpc_subnet_set:  # Service is in this VPC
+                    cluster_arn = svc.properties.get('clusterArn')
+                    if cluster_arn:
+                        # Find the cluster resource
+                        cluster_resource = None
+                        for crid, cres in self.view.filtered_resources.items():
+                            if (cres.resource_type == ResourceType.ECS_CLUSTER and
+                                cres.resource_id == cluster_arn):
+                                cluster_resource = cres
+                                break
+
+                        if cluster_resource:
+                            # Determine which subnet group this service belongs to
+                            service_group = None
+                            for group_name, subnet_ids in group_to_subnets.items():
+                                if svc_subnets & set(subnet_ids):
+                                    service_group = group_name
+                                    break
+
+                            if service_group:
+                                cluster_node_id = f"cluster-{cluster_resource.name}-in-{vpc_id}-{service_group}-logical-subnet"
+                                global_ecs_service_tracking[svc_id] = {
+                                    'cluster_arn': cluster_arn,
+                                    'cluster_node_id': cluster_node_id,
+                                    'group': service_group
+                                }
+                                # Pre-populate group_parent for cross-subnet deduplication
+                                self._group_parent[svc_id] = f"cluster-owned-{cluster_node_id}"
+                                logger.debug(f"Pre-tracked ECS service {svc.name} in group {service_group} for cluster {cluster_node_id}")
+
+        logger.debug(f"Global ECS tracking: {len(global_ecs_service_tracking)} services pre-tracked across all subnet groups")
+
         for group_name in sorted(group_to_subnets.keys()):
             subnet_ids = group_to_subnets[group_name]
             group_node_id = f"{vpc_id}-{group_name}-logical-subnet"
@@ -599,33 +642,37 @@ class AWSLabsTransformer:
                         cluster_data = ecs_clusters_in_subnet.get(cluster_arn) if cluster_arn else None
 
                         if cluster_data:
-                            # Create cluster hierarchy if not already created
-                            if cluster_arn not in cluster_hierarchies:
-                                cluster_resource = cluster_data['cluster_resource']
-                                cluster_node_id = f"cluster-{cluster_resource.name}-in-{group_key}"
+                            # Use global tracking to get the correct cluster node ID
+                            global_service_info = global_ecs_service_tracking.get(svc_id)
+                            if global_service_info:
+                                cluster_node_id = global_service_info['cluster_node_id']
 
-                                cluster_hierarchies[cluster_arn] = {
-                                    'node_id': cluster_node_id,
-                                    'resource': cluster_resource,
-                                    'services_by_sg': {}  # sg_key -> [service_info]
-                                }
-                                logger.debug(f"Will create foundational ECS cluster {cluster_node_id}")
+                                # Create cluster hierarchy if not already created
+                                if cluster_arn not in cluster_hierarchies:
+                                    cluster_resource = cluster_data['cluster_resource']
 
-                            # Collect service info grouped by security groups
-                            cluster_info = cluster_hierarchies[cluster_arn]
-                            sgs = svc.properties.get('security_group_ids', [])
-                            sg_key = tuple(sorted(sgs)) if sgs else ('no-sg',)
+                                    cluster_hierarchies[cluster_arn] = {
+                                        'node_id': cluster_node_id,
+                                        'resource': cluster_resource,
+                                        'services_by_sg': {}  # sg_key -> [service_info]
+                                    }
+                                    logger.debug(f"Will create foundational ECS cluster {cluster_node_id}")
 
-                            if sg_key not in cluster_info['services_by_sg']:
-                                cluster_info['services_by_sg'][sg_key] = []
+                                # Collect service info grouped by security groups
+                                cluster_info = cluster_hierarchies[cluster_arn]
+                                sgs = svc.properties.get('security_group_ids', [])
+                                sg_key = tuple(sorted(sgs)) if sgs else ('no-sg',)
 
-                            cluster_info['services_by_sg'][sg_key].append({
-                                'id': svc_id,
-                                'name': svc.name,
-                                'sgs': sgs
-                            })
-                            self._group_parent[svc_id] = f"cluster-owned-{cluster_info['node_id']}"
-                            logger.debug(f"Grouped ECS service {svc.name} under SG key {sg_key}")
+                                if sg_key not in cluster_info['services_by_sg']:
+                                    cluster_info['services_by_sg'][sg_key] = []
+
+                                cluster_info['services_by_sg'][sg_key].append({
+                                    'id': svc_id,
+                                    'name': svc.name,
+                                    'sgs': sgs
+                                })
+                                # Note: self._group_parent already set in global tracking, no need to duplicate
+                                logger.debug(f"Grouped ECS service {svc.name} under SG key {sg_key}")
 
             # Create the actual cluster resources with SG de-duplication
             for cluster_arn, cluster_info in cluster_hierarchies.items():
@@ -909,6 +956,26 @@ class AWSLabsTransformer:
                                 logger.debug(f"Found EC2 resource for {ec2_id}: {ec2_res.name}")
                             else:
                                 logger.debug(f"No EC2 resource found for {ec2_id} in filtered resources")
+                                # Try to find the EC2 instance in the full topology to identify cross-account/cross-VPC scenarios
+                                ec2_info = self._find_ec2_in_full_topology(ec2_id, vpc_id)
+                                if ec2_info:
+                                    ec2_res = ec2_info['resource']
+                                    location_info = ec2_info['location_info']
+                                    logger.debug(f"Found EC2 {ec2_id} in full topology: {location_info}")
+
+                                    # Update the title to include location information
+                                    title = f"{ec2_res.name or ec2_id}"
+                                    if ec2_info['is_cross_account']:
+                                        title += f" (Cross-Account: {ec2_info['resource'].location.account_id})"
+                                    elif ec2_info['is_cross_region']:
+                                        title += f" (Cross-Region: {ec2_info['resource'].location.region})"
+                                    elif ec2_info['is_cross_vpc']:
+                                        cross_vpc = ec2_info['resource'].properties.get('vpc_id', 'unknown')
+                                        title += f" (Cross-VPC: {cross_vpc})"
+
+                                    resources[ec2_node_id]["Title"] = title
+                                else:
+                                    logger.warning(f"EC2 instance {ec2_id} not found in any account/region in topology")
                             ec2_wrapped = ec2_node_id
                             if ec2_res and ec2_res.properties.get('security_group_ids'):
                                 sgs = ec2_res.properties.get('security_group_ids', [])
@@ -1790,6 +1857,60 @@ class AWSLabsTransformer:
                     "Children": ordered_group_stack_ids
                 }
     
+    def _find_ec2_in_full_topology(self, ec2_id: str, current_vpc_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Find an EC2 instance in the full topology and determine if it's cross-account/cross-VPC.
+
+        Returns:
+            Dict with 'resource', 'is_cross_account', 'is_cross_vpc', 'location_info' if found, None otherwise
+        """
+        if not hasattr(self.view, 'source_topology') or not self.view.source_topology:
+            return None
+
+        # Get current VPC info for comparison
+        current_vpc_resource = self.view.filtered_resources.get(current_vpc_id)
+        if not current_vpc_resource:
+            return None
+
+        current_account = current_vpc_resource.location.account_id
+        current_region = current_vpc_resource.location.region
+
+        # Search all accounts and regions in the full topology
+        for account_id, account_data in self.view.source_topology.organization.accounts.items():
+            for region_name, region_data in account_data.regions.items():
+                for resource_type, resources in region_data.resources.items():
+                    if resource_type == 'ec2_instance':
+                        for resource_id, resource in resources.items():
+                            if resource_id == ec2_id:
+                                # Found the EC2 instance
+                                is_cross_account = account_id != current_account
+                                is_cross_region = region_name != current_region
+
+                                # Check if it's in a different VPC (same account/region)
+                                is_cross_vpc = False
+                                if not is_cross_account and not is_cross_region:
+                                    ec2_vpc = resource.properties.get('vpc_id')
+                                    is_cross_vpc = ec2_vpc != current_vpc_id
+
+                                location_info = f"{account_id}:{region_name}"
+                                if is_cross_account:
+                                    location_info += f" (cross-account)"
+                                elif is_cross_region:
+                                    location_info += f" (cross-region)"
+                                elif is_cross_vpc:
+                                    ec2_vpc = resource.properties.get('vpc_id', 'unknown')
+                                    location_info += f" (VPC: {ec2_vpc})"
+
+                                return {
+                                    'resource': resource,
+                                    'is_cross_account': is_cross_account,
+                                    'is_cross_region': is_cross_region,
+                                    'is_cross_vpc': is_cross_vpc,
+                                    'location_info': location_info
+                                }
+
+        return None
+
     def save_to_file(self, filepath: str) -> None:
         """Save the transformed diagram to a YAML file."""
         import yaml
