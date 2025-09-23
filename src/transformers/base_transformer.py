@@ -128,11 +128,7 @@ class BaseTransformer(ABC):
             if resource_id in self._processed_resources:
                 continue
 
-            # Apply AWS Labs filtering logic to maintain consistency across all formats
-            if self._should_skip_resource_node(resource):
-                logger.debug(f"Skipping resource node {resource_id} ({resource.resource_type})")
-                continue
-
+            # Create nodes for all resources - let individual transformers handle filtering
             node = self._create_node_from_resource(resource)
             self.graph.add_node(node)
             self._processed_resources.add(resource_id)
@@ -256,10 +252,10 @@ class BaseTransformer(ABC):
             self.graph.add_container(container)
 
     def _create_logical_subnet_containers(self) -> None:
-        """Create logical subnet groupings that span availability zones."""
+        """Create logical subnet groupings that aggregate subnets across availability zones."""
         logger.debug("Creating logical subnet containers")
 
-        # Group subnets by VPC and logical type (public/private)
+        # Group subnets by VPC and logical type based on naming patterns
         vpc_subnet_groups = {}  # vpc_id -> {group_name: [subnet_ids]}
 
         for resource_id, resource in self.view.filtered_resources.items():
@@ -270,8 +266,8 @@ class BaseTransformer(ABC):
             if not vpc_id:
                 continue
 
-            # Determine logical group (public/private)
-            group_name = self._get_subnet_logical_group(resource)
+            # Extract logical group from subnet naming patterns and tags
+            group_name = self._extract_subnet_logical_group(resource)
 
             if vpc_id not in vpc_subnet_groups:
                 vpc_subnet_groups[vpc_id] = {}
@@ -280,63 +276,325 @@ class BaseTransformer(ABC):
 
             vpc_subnet_groups[vpc_id][group_name].append(resource_id)
 
-        # Create containers for each logical group
+        # Precompute target group Lambda targets to prevent multi-parenting
+        tg_lambda_targets = self._collect_target_group_lambda_targets()
+
+        # Build ECS service to cluster mapping for proper hierarchy placement
+        ecs_service_clusters = self._build_ecs_service_cluster_mapping(vpc_subnet_groups)
+
+        # Create logical subnet containers with proper resource placement
         for vpc_id, groups in vpc_subnet_groups.items():
             for group_name, subnet_ids in groups.items():
-                container_id = f"{vpc_id}-{group_name}-logical-subnet"
+                container_id = f"{vpc_id}-{group_name.replace('_', '-')}"
 
                 container = GraphContainer(
                     id=container_id,
-                    label=f"{group_name.replace('_', ' ').title()} Subnets",
+                    label=f"{group_name.replace('-', ' ').title()}",
                     container_type="logical_subnet",
                     properties={
                         "vpc_id": vpc_id,
                         "group_name": group_name,
                         "subnet_ids": subnet_ids
                     },
-                    layout_type=LayoutType.HORIZONTAL_STACK,
+                    layout_type=LayoutType.VERTICAL_STACK,
                     style=Style(
-                        fill_color="rgba(122, 161, 22, 0.1)",
+                        fill_color=self._get_subnet_group_styling(group_name),
                         border_color="#7AA116",
                         border_width=1.0
                     )
                 )
 
-                # Find resources in these subnets that exist as nodes in the graph
-                for res_id, res in self.view.filtered_resources.items():
-                    if (hasattr(res, 'properties') and
-                        res.properties.get('subnet_ids') and
-                        res_id in self.graph.nodes):  # Ensure child node exists
-                        res_subnets = set(res.properties.get('subnet_ids', []))
-                        if res_subnets & set(subnet_ids):
-                            container.add_child(res_id)
-                            self._group_parent[res_id] = container_id
+                # Place services in logical subnets based on AWS architectural patterns
+                subnet_set = set(subnet_ids)
 
-                self.graph.add_container(container)
+                # Add ECS cluster hierarchies with proper service grouping
+                self._place_ecs_clusters_in_logical_subnet(container, subnet_set, ecs_service_clusters)
 
-    def _get_subnet_logical_group(self, subnet_resource: BaseResource) -> str:
-        """Determine the logical group for a subnet (public/private)."""
-        subnet_name = (subnet_resource.name or "").lower()
+                # Add standalone services (Lambda, databases) excluding those managed by target groups
+                self._place_standalone_services_in_logical_subnet(container, subnet_set, tg_lambda_targets)
 
-        # Check tags first
+                # Add network interfaces and other resources as appropriate
+                self._place_network_resources_in_logical_subnet(container, subnet_set)
+
+                # Only create container if it will contain resources
+                if container.children_ids:
+                    self.graph.add_container(container)
+                    logger.debug(f"Created logical subnet {container_id} with {len(container.children_ids)} children")
+
+    def _extract_subnet_logical_group(self, subnet_resource: BaseResource) -> str:
+        """Extract logical group name from subnet using naming patterns and tags."""
+        subnet_name = (subnet_resource.name or subnet_resource.resource_id).lower()
+
+        # Check tags first for explicit type designation
         tags = subnet_resource.properties.get('tags', {})
         subnet_type = tags.get('Type', '').lower()
-        if 'public' in subnet_type:
-            return 'public'
-        elif 'private' in subnet_type:
-            return 'private'
+        if subnet_type:
+            if 'public' in subnet_type:
+                return 'public-subnets'
+            elif 'private' in subnet_type:
+                return 'private-subnets'
 
-        # Check name patterns
-        if 'public' in subnet_name:
-            return 'public'
-        elif 'private' in subnet_name:
-            return 'private'
-        elif 'dmz' in subnet_name:
-            return 'dmz'
-        elif 'db' in subnet_name or 'data' in subnet_name:
-            return 'data'
+        # Extract from common naming patterns
+        if 'private' in subnet_name:
+            return 'private-subnets'
+        elif 'public' in subnet_name:
+            return 'public-subnets'
+        elif 'tgw' in subnet_name:
+            return 'tgw-subnets'
+        elif 'db' in subnet_name or 'database' in subnet_name:
+            return 'database-subnets'
+        elif 'web' in subnet_name:
+            return 'web-subnets'
+        elif 'app' in subnet_name:
+            return 'app-subnets'
+        else:
+            # Extract prefix before AZ designation
+            parts = subnet_name.split('-')
+            if len(parts) >= 2:
+                # Remove AZ suffix if present (like '2a', '2b', '2c')
+                import re
+                if re.match(r'^[0-9][a-z]$', parts[-1]):
+                    return '-'.join(parts[:-1]) + '-subnets'
+                else:
+                    return '-'.join(parts[:-1]) + '-subnets' if len(parts) > 1 else subnet_name
+            return 'misc-subnets'
 
-        return 'unknown'
+    def _get_subnet_group_styling(self, group_name: str) -> str:
+        """Get styling color for subnet group based on type."""
+        color_map = {
+            'public-subnets': "rgba(122, 161, 22, 0.15)",  # Green for public
+            'private-subnets': "rgba(255, 153, 0, 0.15)",  # Orange for private
+            'database-subnets': "rgba(54, 99, 136, 0.15)", # Blue for database
+            'web-subnets': "rgba(255, 75, 75, 0.15)",      # Red for web
+            'app-subnets': "rgba(153, 102, 255, 0.15)",    # Purple for app
+        }
+        return color_map.get(group_name, "rgba(122, 161, 22, 0.15)")
+
+    def _collect_target_group_lambda_targets(self) -> Set[str]:
+        """Collect Lambda function IDs that are targets of target groups to prevent multi-parenting."""
+        tg_lambda_targets = set()
+
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type == ResourceType.TARGET_GROUP:
+                target_type = resource.properties.get('target_type')
+                if target_type == 'lambda':
+                    targets = resource.properties.get('targets', [])
+                    for target in targets:
+                        if target.get('id'):
+                            tg_lambda_targets.add(str(target['id']))
+
+        return tg_lambda_targets
+
+    def _build_ecs_service_cluster_mapping(self, vpc_subnet_groups: Dict) -> Dict[str, Dict]:
+        """Build mapping of ECS services to their clusters across all VPCs."""
+        ecs_service_clusters = {}
+
+        # Get all subnet IDs across all VPCs for filtering
+        all_subnet_ids = []
+        for groups in vpc_subnet_groups.values():
+            for subnet_list in groups.values():
+                all_subnet_ids.extend(subnet_list)
+        vpc_subnet_set = set(all_subnet_ids)
+
+        # Map each ECS service to its cluster information
+        for service_id, service_resource in self.view.filtered_resources.items():
+            if service_resource.resource_type == ResourceType.ECS_SERVICE:
+                service_subnets = set(service_resource.properties.get('subnet_ids', []))
+
+                # Only process services in the VPCs we're working with
+                if service_subnets & vpc_subnet_set:
+                    cluster_arn = service_resource.properties.get('clusterArn')
+                    if cluster_arn:
+                        # Find the cluster resource
+                        cluster_resource = None
+                        for cluster_id, cluster_res in self.view.filtered_resources.items():
+                            if (cluster_res.resource_type == ResourceType.ECS_CLUSTER and
+                                cluster_res.resource_id == cluster_arn):
+                                cluster_resource = cluster_res
+                                break
+
+                        if cluster_resource:
+                            # Determine which subnet group this service belongs to
+                            service_group = None
+                            for vpc_id, groups in vpc_subnet_groups.items():
+                                for group_name, subnet_ids in groups.items():
+                                    if service_subnets & set(subnet_ids):
+                                        service_group = group_name
+                                        break
+                                if service_group:
+                                    break
+
+                            ecs_service_clusters[service_id] = {
+                                'cluster_resource': cluster_resource,
+                                'cluster_arn': cluster_arn,
+                                'service_group': service_group,
+                                'service_subnets': service_subnets
+                            }
+
+        return ecs_service_clusters
+
+    def _place_ecs_clusters_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str],
+                                            ecs_service_clusters: Dict[str, Dict]) -> None:
+        """Place ECS cluster hierarchies in logical subnet containers."""
+        # Group services by cluster for this subnet group
+        cluster_services = {}  # cluster_arn -> [service_ids]
+
+        for service_id, cluster_info in ecs_service_clusters.items():
+            service_subnets = cluster_info['service_subnets']
+            if service_subnets & subnet_set:  # Service is in this subnet group
+                cluster_arn = cluster_info['cluster_arn']
+                if cluster_arn not in cluster_services:
+                    cluster_services[cluster_arn] = []
+                cluster_services[cluster_arn].append(service_id)
+
+        # Create cluster containers with service grouping by security groups
+        for cluster_arn, service_ids in cluster_services.items():
+            if service_ids:  # Only create if there are services
+                cluster_info = ecs_service_clusters[service_ids[0]]
+                cluster_resource = cluster_info['cluster_resource']
+
+                cluster_container_id = f"ecs-cluster-{cluster_resource.resource_id}-in-{container.id}"
+
+                # Group services by security groups for de-duplication
+                services_by_sg = self._group_ecs_services_by_security_groups(service_ids)
+
+                cluster_container = GraphContainer(
+                    id=cluster_container_id,
+                    label=cluster_resource.name or cluster_resource.resource_id,
+                    container_type="ecs_cluster",
+                    properties={
+                        "cluster_arn": cluster_arn,
+                        "service_count": len(service_ids)
+                    },
+                    layout_type=LayoutType.VERTICAL_STACK
+                )
+
+                # Add services or security group containers as children
+                for sg_key, grouped_service_ids in services_by_sg.items():
+                    if sg_key == ('no-sg',):
+                        # Services without security groups - add directly
+                        for service_id in grouped_service_ids:
+                            cluster_container.add_child(service_id)
+                    else:
+                        # Services with security groups - create nested containers
+                        sg_container_id = self._create_security_group_container(
+                            sg_key, grouped_service_ids, cluster_container_id
+                        )
+                        cluster_container.add_child(sg_container_id)
+
+                self.graph.add_container(cluster_container)
+                container.add_child(cluster_container_id)
+
+    def _group_ecs_services_by_security_groups(self, service_ids: List[str]) -> Dict[Tuple[str, ...], List[str]]:
+        """Group ECS services by their security group combinations for de-duplication."""
+        services_by_sg = {}
+
+        for service_id in service_ids:
+            service_resource = self.view.filtered_resources.get(service_id)
+            if service_resource:
+                sgs = service_resource.properties.get('security_group_ids', [])
+                sg_key = tuple(sorted(sgs)) if sgs else ('no-sg',)
+
+                if sg_key not in services_by_sg:
+                    services_by_sg[sg_key] = []
+                services_by_sg[sg_key].append(service_id)
+
+        return services_by_sg
+
+    def _create_security_group_container(self, sg_key: Tuple[str, ...], service_ids: List[str],
+                                       parent_id: str) -> str:
+        """Create nested security group containers for shared security groups."""
+        container_id = f"sg-shared-{'-'.join(sg_key[:2])}-in-{parent_id}"
+
+        # Create service stack if multiple services
+        if len(service_ids) == 1:
+            inner_content = service_ids[0]
+        else:
+            stack_id = f"services-stack-in-{parent_id}"
+            services_stack = GraphContainer(
+                id=stack_id,
+                label="Services",
+                container_type="service_stack",
+                layout_type=LayoutType.HORIZONTAL_STACK
+            )
+            for service_id in service_ids:
+                services_stack.add_child(service_id)
+            self.graph.add_container(services_stack)
+            inner_content = stack_id
+
+        # Create nested security group containers (innermost to outermost)
+        current_container = inner_content
+        for sg_id in reversed(list(sg_key)):
+            if sg_id == 'no-sg':
+                continue
+
+            sg_container_id = f"sg-{sg_id}-in-{parent_id}"
+            sg_resource = self.view.filtered_resources.get(sg_id)
+            sg_name = sg_resource.name if sg_resource else sg_id
+
+            sg_container = GraphContainer(
+                id=sg_container_id,
+                label=f"SG: {sg_name}",
+                container_type="security_group",
+                layout_type=LayoutType.FREE_FORM,
+                style=Style(
+                    fill_color="rgba(255,244,230,25)",
+                    border_color="rgba(255,140,0,200)"
+                )
+            )
+            sg_container.add_child(current_container)
+            self.graph.add_container(sg_container)
+            current_container = sg_container_id
+
+        return current_container
+
+    def _place_standalone_services_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str],
+                                                   tg_lambda_targets: Set[str]) -> None:
+        """Place standalone services (Lambda, databases) in logical subnet containers."""
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource_id in self.graph.nodes:  # Ensure node exists
+                resource_subnets = set(resource.properties.get('subnet_ids', []))
+
+                # Check if resource belongs to this subnet group
+                if resource_subnets & subnet_set:
+                    # Handle different service types
+                    if resource.resource_type == ResourceType.LAMBDA_FUNCTION:
+                        # Skip Lambda functions that are target group targets
+                        if resource_id not in tg_lambda_targets:
+                            container.add_child(resource_id)
+
+                    elif resource.resource_type in [
+                        ResourceType.RDS_INSTANCE,
+                        ResourceType.RDS_CLUSTER,
+                        ResourceType.ELASTICACHE_CLUSTER,
+                        ResourceType.OPENSEARCH_DOMAIN,
+                        ResourceType.REDSHIFT_CLUSTER
+                    ]:
+                        # Database and analytics services
+                        container.add_child(resource_id)
+
+    def _place_network_resources_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str]) -> None:
+        """Place network interfaces and other network resources in logical subnet containers."""
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource_id in self.graph.nodes:  # Ensure node exists
+                if resource.resource_type == ResourceType.NETWORK_INTERFACE:
+                    subnet_id = resource.properties.get('subnet_id')
+                    if subnet_id in subnet_set:
+                        # Only include ENIs that are not already associated with services
+                        # Check if this ENI is a member of any service
+                        is_service_eni = False
+                        for rel in self.view.filtered_relationships:
+                            if (rel.source_id == resource_id and
+                                rel.relationship_type == RelationshipType.MEMBER_OF):
+                                target_resource = self.view.filtered_resources.get(rel.target_id)
+                                if target_resource and target_resource.resource_type in [
+                                    ResourceType.ECS_SERVICE, ResourceType.LAMBDA_FUNCTION
+                                ]:
+                                    is_service_eni = True
+                                    break
+
+                        if not is_service_eni:
+                            container.add_child(resource_id)
 
     def _create_physical_subnet_containers(self) -> None:
         """Create individual subnet containers."""
@@ -362,11 +620,10 @@ class BaseTransformer(ABC):
         """Create ECS cluster containers with service groupings."""
         logger.debug("Creating ECS cluster containers")
 
-        # Find all ECS clusters that should be rendered as nodes
+        # Find all ECS clusters that exist as nodes
         clusters = {}
         for rid, res in self.view.filtered_resources.items():
             if (res.resource_type == ResourceType.ECS_CLUSTER and
-                not self._should_skip_resource_node(res) and
                 rid in self.graph.nodes):  # Ensure cluster node exists
                 clusters[rid] = res
 
@@ -378,9 +635,8 @@ class BaseTransformer(ABC):
             for svc_id, svc_res in self.view.filtered_resources.items():
                 if (svc_res.resource_type == ResourceType.ECS_SERVICE and
                     svc_res.properties.get('clusterArn') == cluster_arn):
-                    # Only include services that won't be skipped as nodes AND exist in graph
-                    if (not self._should_skip_resource_node(svc_res) and
-                        svc_id in self.graph.nodes):
+                    # Only include services that exist in graph
+                    if svc_id in self.graph.nodes:
                         services.append(svc_id)
 
             if services:  # Only create container if there are services that will be rendered
