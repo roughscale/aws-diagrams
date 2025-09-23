@@ -76,11 +76,11 @@ def create_test_topology() -> AWSTopology:
         }
     )
 
-    # Build topology
+    # Build topology - use flat resource dictionary
     resources = {
-        "vpc": {"vpc-comparison": vpc},
-        "ec2_instance": {"i-comparison": ec2},
-        "lambda_function": {"comparison-lambda": lambda_func}
+        "vpc-comparison": vpc,
+        "i-comparison": ec2,
+        "comparison-lambda": lambda_func
     }
 
     region_data = RegionData(

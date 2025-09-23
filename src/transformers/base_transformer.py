@@ -8,6 +8,7 @@ the complex topology-to-graph conversion logic that is shared across output form
 from abc import ABC, abstractmethod
 from typing import Dict, List, Any, Optional, Set, Tuple
 import logging
+import math
 
 try:
     from ..views.view_engine import TopologyView
@@ -277,22 +278,55 @@ class BaseTransformer(ABC):
                     layout_type=LayoutType.VERTICAL_STACK
                 )
 
-                # Place services in logical subnets based on AWS architectural patterns
+                # Organize content in rows following V1 pattern
                 subnet_set = set(subnet_ids)
 
-                # Add ECS cluster hierarchies with proper service grouping
-                self._place_ecs_clusters_in_logical_subnet(container, subnet_set, ecs_service_clusters)
+                # Collect different types of resources for proper organization
+                lb_stacks = []  # Load balancer vertical stacks
+                service_nodes = []  # Standalone services (ECS clusters, Lambda, etc.)
+                aux_resources = []  # Network resources (ENIs, NAT gateways, etc.)
 
-                # Add standalone services (Lambda, databases) excluding those managed by target groups
-                self._place_standalone_services_in_logical_subnet(container, subnet_set, tg_lambda_targets)
+                # Add ECS cluster hierarchies
+                ecs_clusters = self._collect_ecs_clusters_for_logical_subnet(subnet_set, ecs_service_clusters)
+                service_nodes.extend(ecs_clusters)
 
-                # Add network interfaces and other resources as appropriate
-                self._place_network_resources_in_logical_subnet(container, subnet_set)
+                # Add standalone services (Lambda, databases)
+                standalone_services = self._collect_standalone_services_for_logical_subnet(subnet_set, tg_lambda_targets)
+                service_nodes.extend(standalone_services)
 
-                # Only create container if it will contain resources
+                # Add auxiliary network resources
+                network_resources = self._collect_network_resources_for_logical_subnet(subnet_set)
+                aux_resources.extend(network_resources)
+
+                # Create row-based organization
+                rows = []
+
+                # Row 1: Load balancer stacks (if any)
+                if lb_stacks:
+                    rows.extend(lb_stacks)
+
+                # Row 2: Service grid (ECS clusters, Lambda, databases)
+                if service_nodes:
+                    if len(service_nodes) > 1:
+                        # Create grid for multiple services
+                        grid_container_id = f"{container_id}-services-grid"
+                        grid_container = self._create_service_grid(grid_container_id, service_nodes)
+                        if grid_container:
+                            rows.append(grid_container)
+                    else:
+                        rows.extend(service_nodes)
+
+                # Row 3: Auxiliary resources (ENIs, NAT gateways)
+                if aux_resources:
+                    rows.extend(aux_resources)
+
+                # Set the organized rows as children
+                container.children_ids = rows
+
+                # Only create container if it has content
                 if container.children_ids:
                     self.graph.add_container(container)
-                    logger.debug(f"Created logical subnet {container_id} with {len(container.children_ids)} children")
+                    logger.debug(f"Created logical subnet {container_id} with {len(rows)} rows")
 
     def _extract_subnet_logical_group(self, subnet_resource: BaseResource) -> str:
         """Extract logical group name from subnet using naming patterns and tags."""
@@ -396,10 +430,9 @@ class BaseTransformer(ABC):
 
         return ecs_service_clusters
 
-    def _place_ecs_clusters_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str],
-                                            ecs_service_clusters: Dict[str, Dict]) -> None:
-        """Place ECS cluster hierarchies in logical subnet containers."""
-        # Group services by cluster for this subnet group
+    def _collect_ecs_clusters_for_logical_subnet(self, subnet_set: Set[str],
+                                               ecs_service_clusters: Dict[str, Dict]) -> List[str]:
+        """Collect ECS cluster container IDs for this logical subnet."""
         cluster_services = {}  # cluster_arn -> [service_ids]
 
         for service_id, cluster_info in ecs_service_clusters.items():
@@ -410,6 +443,8 @@ class BaseTransformer(ABC):
                     cluster_services[cluster_arn] = []
                 cluster_services[cluster_arn].append(service_id)
 
+        cluster_container_ids = []
+
         # Create cluster containers with service grouping by security groups
         for cluster_arn, service_ids in cluster_services.items():
             if service_ids:  # Only create if there are services
@@ -418,9 +453,7 @@ class BaseTransformer(ABC):
 
                 # Use V1-style cluster ID pattern for consistency
                 cluster_name = cluster_resource.name or cluster_resource.resource_id.split('/')[-1]
-                vpc_id = container.properties.get('vpc_id', 'unknown')
-                group_name = container.properties.get('group_name', 'unknown')
-                cluster_container_id = f"cluster-{cluster_name}-in-{vpc_id}-{group_name}"
+                cluster_container_id = f"cluster-{cluster_name}-logical-subnet"
 
                 # Group services by security groups for de-duplication
                 services_by_sg = self._group_ecs_services_by_security_groups(service_ids)
@@ -450,7 +483,9 @@ class BaseTransformer(ABC):
                         cluster_container.add_child(sg_container_id)
 
                 self.graph.add_container(cluster_container)
-                container.add_child(cluster_container_id)
+                cluster_container_ids.append(cluster_container_id)
+
+        return cluster_container_ids
 
     def _group_ecs_services_by_security_groups(self, service_ids: List[str]) -> Dict[Tuple[str, ...], List[str]]:
         """Group ECS services by their security group combinations for de-duplication."""
@@ -511,9 +546,11 @@ class BaseTransformer(ABC):
 
         return current_container
 
-    def _place_standalone_services_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str],
-                                                   tg_lambda_targets: Set[str]) -> None:
-        """Place standalone services (Lambda, databases) in logical subnet containers."""
+    def _collect_standalone_services_for_logical_subnet(self, subnet_set: Set[str],
+                                                      tg_lambda_targets: Set[str]) -> List[str]:
+        """Collect standalone services (Lambda, databases) for this logical subnet."""
+        service_ids = []
+
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self.graph.nodes:  # Ensure node exists
                 resource_subnets = set(resource.properties.get('subnet_ids', []))
@@ -524,7 +561,7 @@ class BaseTransformer(ABC):
                     if resource.resource_type == ResourceType.LAMBDA_FUNCTION:
                         # Skip Lambda functions that are target group targets
                         if resource_id not in tg_lambda_targets:
-                            container.add_child(resource_id)
+                            service_ids.append(resource_id)
 
                     elif resource.resource_type in [
                         ResourceType.RDS_INSTANCE,
@@ -534,10 +571,14 @@ class BaseTransformer(ABC):
                         ResourceType.REDSHIFT_CLUSTER
                     ]:
                         # Database and analytics services
-                        container.add_child(resource_id)
+                        service_ids.append(resource_id)
 
-    def _place_network_resources_in_logical_subnet(self, container: GraphContainer, subnet_set: Set[str]) -> None:
-        """Place network interfaces and other network resources in logical subnet containers."""
+        return service_ids
+
+    def _collect_network_resources_for_logical_subnet(self, subnet_set: Set[str]) -> List[str]:
+        """Collect network interfaces and other network resources for this logical subnet."""
+        network_resource_ids = []
+
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self.graph.nodes:  # Ensure node exists
                 if resource.resource_type == ResourceType.NETWORK_INTERFACE:
@@ -557,7 +598,61 @@ class BaseTransformer(ABC):
                                     break
 
                         if not is_service_eni:
-                            container.add_child(resource_id)
+                            network_resource_ids.append(resource_id)
+
+        return network_resource_ids
+
+    def _create_service_grid(self, grid_container_id: str, service_ids: List[str]) -> str:
+        """Create a grid layout for services following V1 pattern."""
+        if not service_ids:
+            return None
+
+        # For single service, return the service ID directly
+        if len(service_ids) == 1:
+            return service_ids[0]
+
+        # Calculate grid dimensions (near-square)
+        n = len(service_ids)
+        rows = max(1, int(math.ceil(math.sqrt(n))))
+        cols = max(1, int(math.ceil(n / rows)))
+
+        # Create the grid container
+        grid_container = GraphContainer(
+            id=grid_container_id,
+            label="Services",
+            container_type="service_grid",
+            layout_type=LayoutType.VERTICAL_STACK
+        )
+
+        for i in range(rows):
+            start = i * cols
+            end = start + cols
+            row_services = service_ids[start:end]
+
+            if not row_services:
+                continue
+
+            if len(row_services) == 1:
+                # Single service in row - add directly
+                grid_container.add_child(row_services[0])
+            else:
+                # Multiple services in row - create horizontal stack
+                row_id = f"{grid_container_id}-row-{i+1}"
+                row_container = GraphContainer(
+                    id=row_id,
+                    label=f"Service Row {i+1}",
+                    container_type="service_row",
+                    layout_type=LayoutType.HORIZONTAL_STACK
+                )
+
+                for service_id in row_services:
+                    row_container.add_child(service_id)
+
+                self.graph.add_container(row_container)
+                grid_container.add_child(row_id)
+
+        self.graph.add_container(grid_container)
+        return grid_container_id
 
     def _create_physical_subnet_containers(self) -> None:
         """Create individual subnet containers."""
