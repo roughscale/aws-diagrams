@@ -113,6 +113,7 @@ class AWSLabsTransformer:
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
         logger.info(f"Transforming view '{self.view.name}' to AWS Labs format")
+        logger.debug("DEBUG TEST: This is an unconditional debug message to test DEBUG logging")
         
         # Create nodes for resources
         self._create_resource_nodes()
