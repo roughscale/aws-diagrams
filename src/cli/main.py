@@ -18,14 +18,7 @@ try:
 except ImportError:
     pass  # dotenv not available, continue without it
 
-# Handle imports for both package and script execution
-try:
-    from ..utils.logger import setup_logging, get_logger
-except ImportError:
-    # Add src to path when running as script
-    src_path = Path(__file__).parent.parent
-    sys.path.insert(0, str(src_path))
-    from utils.logger import setup_logging, get_logger
+# Handle imports for both package and script execution - delay logger import
 
 
 @click.group()
@@ -57,6 +50,15 @@ def cli(ctx, log_level: str, log_file: Optional[str], profile: Optional[str], re
     # Ensure context object exists
     ctx.ensure_object(dict)
     
+    # Import logger module now that we have the log level
+    try:
+        from ..utils.logger import setup_logging, get_logger
+    except ImportError:
+        # Add src to path when running as script
+        src_path = Path(__file__).parent.parent
+        sys.path.insert(0, str(src_path))
+        from utils.logger import setup_logging, get_logger
+
     # Set up logging
     logger = setup_logging(level=log_level, log_file=log_file)
     

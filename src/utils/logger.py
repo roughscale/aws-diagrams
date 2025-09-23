@@ -293,20 +293,24 @@ def setup_logging(
 ) -> logging.Logger:
     """
     Set up logging for the application.
-    
+
     Args:
         level: Logging level
         log_file: Path to log file (optional)
         structured: Whether to use structured JSON logging
-        
+
     Returns:
         Configured logger instance
     """
-    # Get configuration from environment variables
-    level = os.getenv('LOG_LEVEL', level).upper()
+    # Get configuration from environment variables, but prioritize passed parameter
+    # Only use env var if no explicit level was passed (i.e., if it's the default "INFO")
+    if level == "INFO":
+        level = os.getenv('LOG_LEVEL', level).upper()
+    else:
+        level = level.upper()
     log_file_path = Path(os.getenv('LOG_FILE', log_file)) if log_file or os.getenv('LOG_FILE') else None
     structured = os.getenv('LOG_STRUCTURED', str(structured)).lower() == 'true'
-    
+
     # Create topology logger
     topology_logger = TopologyLogger(
         name="aws-topology",
@@ -350,8 +354,6 @@ def get_collection_logger(
     return CollectionLogger(account_id, region, collector_name, base_logger)
 
 
-# Configure logging for the module
-_logger = setup_logging()
 
 
 def get_logger(name: str = "") -> logging.Logger:
