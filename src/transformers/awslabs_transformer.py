@@ -20,6 +20,8 @@ except ImportError:
     from topology.schema import ResourceType, BaseResource, Relationship, RelationshipType
 
 logger = logging.getLogger(__name__)
+# Ensure this logger inherits the root logger level
+logger.setLevel(logging.NOTSET)  # This makes it inherit from parent/root
 
 
 @dataclass
