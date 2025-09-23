@@ -136,8 +136,8 @@ class AWSLabsTransformerV2(BaseTransformer):
                 "Type": "AWS::EC2::VPC",
                 "Title": container.label,
                 "Children": container.children_ids,
-                "FillColor": "rgba(255, 153, 0, 0.1)",
-                "BorderColor": "#FF9900"
+                "FillColor": "rgba(255,153,0,25)",
+                "BorderColor": "rgba(255,153,0,200)"
             }
         elif container.container_type == "logical_subnet":
             preset = "PublicSubnet" if "public" in container.label.lower() else "PrivateSubnet"
@@ -207,16 +207,16 @@ class AWSLabsTransformerV2(BaseTransformer):
         if not node.resource_type:
             return
 
-        # Add resource-specific properties
+        # Add resource-specific properties using DAC-compatible rgba format
         if node.resource_type == ResourceType.VPC:
             resource.update({
-                "FillColor": "rgba(255, 153, 0, 0.1)",
-                "BorderColor": "#FF9900"
+                "FillColor": "rgba(255,153,0,25)",
+                "BorderColor": "rgba(255,153,0,200)"
             })
         elif node.resource_type == ResourceType.SECURITY_GROUP:
             resource.update({
-                "FillColor": "rgba(255, 75, 75, 0.1)",
-                "BorderColor": "#FF4B4B"
+                "FillColor": "rgba(255,244,230,25)",
+                "BorderColor": "rgba(255,140,0,200)"
             })
         elif node.resource_type in [ResourceType.ECS_CLUSTER, ResourceType.ECS_SERVICE]:
             # ECS resources don't render as standalone nodes in service-centric layout
