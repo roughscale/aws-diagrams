@@ -592,28 +592,63 @@ class BaseTransformer(ABC):
         """Collect network interfaces and other network resources for this logical subnet."""
         network_resource_ids = []
 
+        # First, collect ENI IDs that belong to aggregated services (following V1 pattern)
+        service_eni_ids = self._collect_service_eni_ids()
+
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self.graph.nodes:  # Ensure node exists
                 if resource.resource_type == ResourceType.NETWORK_INTERFACE:
                     subnet_id = resource.properties.get('subnet_id')
                     if subnet_id in subnet_set:
                         # Only include ENIs that are not already associated with services
-                        # Check if this ENI is a member of any service
+                        # Check if this ENI is a member of any service or belongs to aggregated services
                         is_service_eni = False
-                        for rel in self.view.filtered_relationships:
-                            if (rel.source_id == resource_id and
-                                rel.relationship_type == RelationshipType.MEMBER_OF):
-                                target_resource = self.view.filtered_resources.get(rel.target_id)
-                                if target_resource and target_resource.resource_type in [
-                                    ResourceType.ECS_SERVICE, ResourceType.LAMBDA_FUNCTION
-                                ]:
-                                    is_service_eni = True
-                                    break
+
+                        # Check if ENI belongs to aggregated services (RDS, ElastiCache, etc.)
+                        if resource_id in service_eni_ids:
+                            is_service_eni = True
+                        else:
+                            # Check if ENI is a member of other services
+                            for rel in self.view.filtered_relationships:
+                                if (rel.source_id == resource_id and
+                                    rel.relationship_type == RelationshipType.MEMBER_OF):
+                                    target_resource = self.view.filtered_resources.get(rel.target_id)
+                                    if target_resource and target_resource.resource_type in [
+                                        ResourceType.ECS_SERVICE, ResourceType.LAMBDA_FUNCTION
+                                    ]:
+                                        is_service_eni = True
+                                        break
 
                         if not is_service_eni:
                             network_resource_ids.append(resource_id)
 
         return network_resource_ids
+
+    def _collect_service_eni_ids(self) -> Set[str]:
+        """Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)."""
+        service_eni_ids = set()
+
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type in [
+                ResourceType.RDS_INSTANCE,
+                ResourceType.RDS_CLUSTER,
+                ResourceType.ELASTICACHE_CLUSTER,
+                ResourceType.OPENSEARCH_DOMAIN,
+                ResourceType.REDSHIFT_CLUSTER
+            ]:
+                # Get ENI IDs from resource properties
+                for eni_id in resource.properties.get('network_interface_ids', []) or []:
+                    service_eni_ids.add(eni_id)
+
+                # Also check for ENI relationships (MEMBER_OF pointing to this service)
+                for rel in self.view.filtered_relationships:
+                    if (rel.relationship_type == RelationshipType.MEMBER_OF and
+                        rel.target_id == resource_id):
+                        eni = self.view.filtered_resources.get(rel.source_id)
+                        if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
+                            service_eni_ids.add(eni.resource_id)
+
+        return service_eni_ids
 
     def _is_resource_in_logical_subnet(self, resource_id: str) -> bool:
         """Check if a resource is already included in a logical subnet container."""
