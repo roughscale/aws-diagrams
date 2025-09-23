@@ -315,8 +315,17 @@ def setup_logging(
         structured=structured
     )
 
-    # Also set the root logger level to ensure all child loggers inherit the level
-    logging.getLogger().setLevel(getattr(logging, level))
+    # Also set the root logger level and add a handler to ensure all child loggers work
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, level))
+
+    # Add console handler to root logger if it doesn't have one
+    if not root_logger.handlers:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(getattr(logging, level))
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
 
     return topology_logger.get_logger()
 
