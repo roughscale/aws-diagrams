@@ -570,19 +570,26 @@ class AWSLabsTransformer:
                         logger.debug(f"Processing service {res.name} for clustering")
                         # Find the cluster resource
                         cluster_resource = None
+                        cluster_resources_found = []
                         for crid, cres in self.view.filtered_resources.items():
+                            if cres.resource_type == ResourceType.ECS_CLUSTER:
+                                cluster_resources_found.append(cres.resource_id)
                             if (cres.resource_type == ResourceType.ECS_CLUSTER and
                                 cres.resource_id == cluster_arn):
                                 cluster_resource = cres
                                 break
 
                         if cluster_resource:
+                            logger.debug(f"Found matching cluster resource for {res.name}")
                             if cluster_arn not in ecs_clusters_in_subnet:
                                 ecs_clusters_in_subnet[cluster_arn] = {
                                     'cluster_resource': cluster_resource,
                                     'services': []
                                 }
                             ecs_clusters_in_subnet[cluster_arn]['services'].append(rid)
+                        else:
+                            logger.debug(f"No cluster resource found for {res.name} with ARN {cluster_arn}")
+                            logger.debug(f"Available cluster resources: {cluster_resources_found[:5]}...")  # Show first 5
 
             # Debug logging
             logger.debug(f"Found {ecs_services_found} ECS services total, {ecs_services_with_clusters} with cluster ARNs")
