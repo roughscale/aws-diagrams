@@ -314,7 +314,10 @@ def setup_logging(
         log_file=log_file_path,
         structured=structured
     )
-    
+
+    # Also set the root logger level to ensure all child loggers inherit the level
+    logging.getLogger().setLevel(getattr(logging, level))
+
     return topology_logger.get_logger()
 
 
