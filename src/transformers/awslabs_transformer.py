@@ -560,9 +560,14 @@ class AWSLabsTransformer:
                     # Debug: Check if service has cluster ARN
                     if cluster_arn:
                         ecs_services_with_clusters += 1
+                        logger.debug(f"Service {res.name} has cluster ARN: {cluster_arn}")
+                        logger.debug(f"Service subnets: {service_subnets}, logical subnet set: {subnet_set}")
+                        if not (service_subnets & subnet_set):
+                            logger.debug(f"Service {res.name} not in current logical subnet group")
 
                     # Only collect services that are in this logical subnet
                     if cluster_arn and service_subnets & subnet_set:
+                        logger.debug(f"Processing service {res.name} for clustering")
                         # Find the cluster resource
                         cluster_resource = None
                         for crid, cres in self.view.filtered_resources.items():
