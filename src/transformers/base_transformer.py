@@ -121,15 +121,50 @@ class BaseTransformer(ABC):
 
         return self.graph
 
+    def _collect_service_eni_ids(self) -> Set[str]:
+        """Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)."""
+        service_eni_ids = set()
+
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type in [
+                ResourceType.RDS_INSTANCE,
+                ResourceType.RDS_CLUSTER,
+                ResourceType.ELASTICACHE_CLUSTER,
+                ResourceType.OPENSEARCH_DOMAIN,
+                ResourceType.REDSHIFT_CLUSTER
+            ]:
+                # Get ENI IDs from resource properties
+                for eni_id in resource.properties.get('network_interface_ids', []) or []:
+                    service_eni_ids.add(eni_id)
+
+                # Also check for ENI relationships (MEMBER_OF pointing to this service)
+                for rel in self.view.filtered_relationships:
+                    if (rel.relationship_type == RelationshipType.MEMBER_OF and
+                        rel.target_id == resource_id):
+                        eni = self.view.filtered_resources.get(rel.source_id)
+                        if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
+                            service_eni_ids.add(eni.resource_id)
+
+        return service_eni_ids
+
     def _create_resource_nodes(self) -> None:
         """Create nodes for all resources in the view."""
         logger.debug("Creating resource nodes")
+
+        # Collect ENI IDs that belong to aggregated services to avoid cycles
+        service_eni_ids = self._collect_service_eni_ids()
 
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self._processed_resources:
                 continue
 
-            # Create nodes for all resources - let individual transformers handle filtering
+            # Skip ENIs that belong to aggregated services (following V1 pattern)
+            if (resource.resource_type == ResourceType.NETWORK_INTERFACE and
+                resource_id in service_eni_ids):
+                logger.debug(f"Skipping ENI {resource_id} - belongs to aggregated service")
+                continue
+
+            # Create nodes for resources that should be displayed
             node = self._create_node_from_resource(resource)
             self.graph.add_node(node)
             self._processed_resources.add(resource_id)
@@ -623,32 +658,6 @@ class BaseTransformer(ABC):
                             network_resource_ids.append(resource_id)
 
         return network_resource_ids
-
-    def _collect_service_eni_ids(self) -> Set[str]:
-        """Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)."""
-        service_eni_ids = set()
-
-        for resource_id, resource in self.view.filtered_resources.items():
-            if resource.resource_type in [
-                ResourceType.RDS_INSTANCE,
-                ResourceType.RDS_CLUSTER,
-                ResourceType.ELASTICACHE_CLUSTER,
-                ResourceType.OPENSEARCH_DOMAIN,
-                ResourceType.REDSHIFT_CLUSTER
-            ]:
-                # Get ENI IDs from resource properties
-                for eni_id in resource.properties.get('network_interface_ids', []) or []:
-                    service_eni_ids.add(eni_id)
-
-                # Also check for ENI relationships (MEMBER_OF pointing to this service)
-                for rel in self.view.filtered_relationships:
-                    if (rel.relationship_type == RelationshipType.MEMBER_OF and
-                        rel.target_id == resource_id):
-                        eni = self.view.filtered_resources.get(rel.source_id)
-                        if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
-                            service_eni_ids.add(eni.resource_id)
-
-        return service_eni_ids
 
     def _is_resource_in_logical_subnet(self, resource_id: str) -> bool:
         """Check if a resource is already included in a logical subnet container."""
