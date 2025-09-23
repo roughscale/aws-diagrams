@@ -5,8 +5,16 @@ This module transforms generic graph representations into draw.io XML format
 with proper AWS icon support, hierarchical grouping, and automatic layout.
 """
 
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
+try:
+    from defusedxml import ElementTree as ET
+    from defusedxml import minidom
+except ImportError:
+    # Fallback to standard library with warning
+    import xml.etree.ElementTree as ET
+    from xml.dom import minidom
+    import warnings
+    warnings.warn("defusedxml not available, using potentially insecure XML parsing", UserWarning)
+
 import base64
 import zlib
 from typing import Dict, List, Any, Optional, Tuple
@@ -23,8 +31,8 @@ except ImportError:
     from views.view_engine import TopologyView
     from topology.schema import ResourceType
     from utils.logger import get_logger
-    from base_transformer import BaseTransformer
-    from graph_model import DiagramGraph, GraphNode, GraphEdge, GraphContainer, NodeType, LayoutType
+    from transformers.base_transformer import BaseTransformer
+    from transformers.graph_model import DiagramGraph, GraphNode, GraphEdge, GraphContainer, NodeType, LayoutType
 
 logger = get_logger("drawio_transformer")
 

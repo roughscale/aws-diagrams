@@ -7,7 +7,12 @@ ensuring it properly converts topology views to draw.io XML format.
 
 import unittest
 from unittest.mock import Mock, patch
-import xml.etree.ElementTree as ET
+try:
+    from defusedxml import ElementTree as ET
+except ImportError:
+    import xml.etree.ElementTree as ET
+    import warnings
+    warnings.warn("defusedxml not available, using potentially insecure XML parsing", UserWarning)
 from datetime import datetime
 from pathlib import Path
 

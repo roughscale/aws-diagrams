@@ -21,7 +21,7 @@ except ImportError:
     from views.view_engine import TopologyView
     from topology.schema import ResourceType, BaseResource, Relationship, RelationshipType
     from utils.logger import get_logger
-    from graph_model import (
+    from transformers.graph_model import (
         DiagramGraph, GraphNode, GraphEdge, GraphContainer, Style, Position,
         NodeType, LayoutType, DiagramMetadata
     )

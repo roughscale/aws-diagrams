@@ -9,6 +9,7 @@ pydantic>=2.5.0
 python-dotenv>=1.0.0
 
 # Optional diagram format support
+defusedxml>=0.7.1  # For secure XML parsing in draw.io format
 # d2>=0.6.0  # For D2 diagram format (optional)
 # plantuml>=0.3.0  # For PlantUML format (optional)
 

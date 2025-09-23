@@ -18,8 +18,8 @@ except ImportError:
     from views.view_engine import TopologyView
     from topology.schema import ResourceType
     from utils.logger import get_logger
-    from base_transformer import BaseTransformer
-    from graph_model import DiagramGraph, GraphNode, GraphEdge, GraphContainer, NodeType, LayoutType
+    from transformers.base_transformer import BaseTransformer
+    from transformers.graph_model import DiagramGraph, GraphNode, GraphEdge, GraphContainer, NodeType, LayoutType
 
 logger = get_logger("awslabs_transformer_v2")
 
