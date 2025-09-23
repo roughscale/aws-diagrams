@@ -459,7 +459,20 @@ class ViewEngine:
                                     )
                                     vpc_resources[peer_id] = synthetic
                                     break
-        
+
+        # Include ECS clusters when their services are in the VPC
+        for resource_id, resource in all_resources.items():
+            if resource.resource_type == ResourceType.ECS_CLUSTER:
+                # Check if any ECS services in this VPC belong to this cluster
+                cluster_arn = resource.arn
+                for vpc_resource_id, vpc_resource in vpc_resources.items():
+                    if (vpc_resource.resource_type == ResourceType.ECS_SERVICE and
+                        vpc_resource.properties.get('clusterArn') == cluster_arn):
+                        # Found a service in this VPC that belongs to this cluster
+                        vpc_resources[resource_id] = resource
+                        logger.debug(f"Including ECS cluster {resource.name} because service {vpc_resource.name} is in VPC {vpc_id}")
+                        break
+
         # Apply optional explicit filters for account/region without cross-account expansion
         if account_id:
             vpc_resources = {rid: res for rid, res in vpc_resources.items() if res.location.account_id == account_id}
