@@ -703,144 +703,230 @@ class AWSLabsTransformer:
 
             group_key = group_node_id
 
-            # Prepare per-group TG registry
-            self._tg_nodes_by_group.setdefault(group_node_id, [])
+            # NEW GENERALIZED LB/TG STRUCTURE WITH SG-FIRST HIERARCHY
+            # Create clean LB vertical stacks with proper SG wrapping and target grouping
+
             for lb_id in lb_children:
                 lb_res = self.view.filtered_resources.get(lb_id)
                 lb_title = (lb_res.name if lb_res else None) or lb_id
-                lb_icon_id = f"lb-icon-{lb_id}-in-{group_key}"
-                if lb_icon_id not in resources:
-                    resources[lb_icon_id] = {
-                        "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
-                        "Title": lb_title,
-                    }
-                same_group_tg_nodes: List[str] = []
+
+                # Create the base LB node
+                lb_node_id = f"lb-{lb_id}-in-{group_key}"
+                resources[lb_node_id] = {
+                    "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+                    "Title": lb_title,
+                }
+
+                # Wrap LB in its security groups (SG-first principle)
+                lb_wrapped_node = lb_node_id
+                if lb_res and hasattr(lb_res, 'properties') and lb_res.properties.get('security_group_ids'):
+                    sgs = lb_res.properties.get('security_group_ids', [])
+                    current_container = lb_node_id
+
+                    for sg_id in reversed(sgs):  # Innermost to outermost
+                        sg_container_id = f"sg-{sg_id}-container-lb-{lb_id}-in-{group_key}"
+                        sg_res = self.view.filtered_resources.get(sg_id)
+                        sg_name = None
+                        if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                            sg_name = sg_res.name or sg_res.properties.get('group_name')
+
+                        resources[sg_container_id] = {
+                            "Type": "AWS::EC2::SecurityGroup",
+                            "Title": f"SG: {sg_name or sg_id}",
+                            "Children": [current_container],
+                            "FillColor": "rgba(255,244,230,25)",
+                            "BorderColor": "rgba(255,140,0,200)"
+                        }
+                        current_container = sg_container_id
+
+                    lb_wrapped_node = current_container
+
+                # Process target groups for this LB
+                lb_tg_sections: List[str] = []
+
                 for tg_id in lb_to_tgs.get(lb_id, []):
                     tg = self.view.filtered_resources.get(tg_id)
                     if not tg:
                         continue
-                    svc_grand_children: List[str] = []
-                    target_subnets: List[str] = []
-                    # ECS backends - check if any targeted services are in pre-created clusters
-                    targeted_clusters_for_tg = set()
+
+                    # Analyze targets by type
+                    ecs_clusters_for_tg = set()
+                    lambda_targets = []
+                    ec2_targets = []
+                    ip_targets = []
+
+                    # Process ECS service targets
                     for svc_id, svc in self.view.filtered_resources.items():
                         if svc.resource_type == ResourceType.ECS_SERVICE:
                             tgs = set(svc.properties.get('target_group_arns') or [])
                             if tg_id in tgs:
                                 cluster_arn = svc.properties.get('clusterArn')
-                                # Find if this service's cluster was pre-created
-                                for c_arn, c_info in cluster_hierarchies.items():
-                                    if c_arn == cluster_arn:
-                                        cluster_node_id = c_info['node_id']
-                                        targeted_clusters_for_tg.add(cluster_node_id)
-                                        logger.debug(f"Found targeted ECS service {svc.name} in cluster {cluster_node_id} for TG {tg_id}")
-                                        break
+                                if cluster_arn in cluster_hierarchies:
+                                    cluster_node_id = cluster_hierarchies[cluster_arn]['node_id']
+                                    ecs_clusters_for_tg.add(cluster_node_id)
+                                    logger.debug(f"Found ECS cluster {cluster_node_id} for TG {tg_id}")
 
-                                # Always collect subnets for placement
-                                for s in (svc.properties or {}).get('subnet_ids') or []:
-                                    target_subnets.append(s)
-
-                    # Add the targeted clusters to this TG's children
-                    for cluster_node_id in targeted_clusters_for_tg:
-                        if cluster_node_id not in svc_grand_children:
-                            svc_grand_children.append(cluster_node_id)
-                            logger.debug(f"Added foundational ECS cluster {cluster_node_id} to TG {tg_id}")
-                    # Lambda/EC2/IP backends
-                    for t in tg.properties.get('targets') or []:
-                        tid = t.get('id')
+                    # Process direct targets (Lambda, EC2, IPs)
+                    for target in tg.properties.get('targets') or []:
+                        tid = target.get('id')
                         if not tid:
                             continue
-                        if str(tid).startswith('arn:aws:lambda:'):
-                            child_id = f"lambda-{tid}-in-{group_key}"
-                            lf = self.view.filtered_resources.get(tid)
-                            # Check if this Lambda is already placed elsewhere to prevent cycles
-                            if child_id not in resources and tid not in self._group_parent:
-                                resources[child_id] = {"Type": "AWS::Lambda::Function", "Title": (lf.name if lf else None) or tid}
-                                self._group_parent[tid] = f"tg-owned-{tg_id}"
-                                svc_grand_children.append(child_id)
-                            if lf:
-                                for s in (lf.properties or {}).get('subnet_ids') or []:
-                                    target_subnets.append(s)
-                        elif str(tid).startswith('i-'):
-                            child_id = f"ec2-{tid}-in-{group_key}"
-                            # Check if this EC2 instance is already placed elsewhere to prevent cycles
-                            if child_id not in resources and tid not in self._group_parent:
-                                resources[child_id] = {"Type": "AWS::EC2::Instance", "Title": tid}
-                                self._group_parent[tid] = f"tg-owned-{tg_id}"
-                                svc_grand_children.append(child_id)
-                            inst = self.view.filtered_resources.get(tid)
-                            if inst:
-                                s = (inst.properties or {}).get('subnet_id')
-                                if s:
-                                    target_subnets.append(s)
-                        elif '.' in str(tid):
-                            ip = str(tid)
-                            port = t.get('port')
-                            # Deduplicate IP if it maps to a known service already included
-                            mapped_svc = self._find_service_id_by_ip(ip)
-                            if mapped_svc:
-                                ecs_child = f"ecs-{mapped_svc}-in-{group_key}"
-                                lam_child = f"lambda-{mapped_svc}-in-{group_key}"
-                                if ecs_child in svc_grand_children or lam_child in svc_grand_children:
-                                    # Skip adding IP node
-                                    pass
-                                else:
-                                    # Fallback: still show IP if mapped service node wasn't added
-                                    ip_child = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
-                                    if ip_child not in resources:
-                                        title = f"IP {ip}{(':'+str(port)) if port else ''}"
-                                        resources[ip_child] = {"Type": "AWS::EC2::Instance", "Title": title}
-                                    svc_grand_children.append(ip_child)
-                            else:
-                                ip_child = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
-                                if ip_child not in resources:
-                                    title = f"IP {ip}{(':'+str(port)) if port else ''}"
-                                    resources[ip_child] = {"Type": "AWS::EC2::Instance", "Title": title}
-                                svc_grand_children.append(ip_child)
-                            # map IP to ENI to get subnet
-                            for rid, res in self.view.filtered_resources.items():
-                                if getattr(res, 'resource_type', None) == ResourceType.NETWORK_INTERFACE and (res.properties or {}).get('private_ip') == ip:
-                                    s = (res.properties or {}).get('subnet_id')
-                                    if s:
-                                        target_subnets.append(s)
-                    # Decide placement group for TG by majority of target subnets
-                    place_group_node = group_node_id
-                    if target_subnets:
-                        counts: Dict[str, int] = {}
-                        for s in target_subnets:
-                            for gname, subs in group_to_subnets.items():
-                                if s in subs:
-                                    gnode = f"{vpc_id}-{gname}-logical-subnet"
-                                    counts[gnode] = counts.get(gnode, 0) + 1
-                                    break
-                        if counts:
-                            place_group_node = max(counts, key=counts.get)
-                    # Build TG stack vertical with row; register under placement group
-                    tg_node_id = f"tg-{tg_id}-in-{place_group_node}"
-                    targets_row_id = f"{tg_node_id}-targets-row"
-                    resources[targets_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": svc_grand_children or []}
-                    tg_title = f"TG: {(tg.name or 'Target Group')}"
-                    resources[tg_node_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": tg_title, "Children": [targets_row_id]}
-                    if place_group_node == group_node_id:
-                        # Same logical subnet: show TG stack under LB stack (vertical)
-                        same_group_tg_nodes.append(tg_node_id)
-                    else:
-                        # Cross-subnet: place TG in its target group and link LB->TG
-                        self._tg_nodes_by_group.setdefault(place_group_node, []).append(tg_node_id)
-                        self._lb_tg_links.add((lb_icon_id, tg_node_id))
-                    # Record meta for ordering in target groups
-                    self._tg_meta[tg_node_id] = (lb_title, tg.name or tg_id)
-                # Build LB stack
-                lb_stack_id = f"lb-{lb_id}-box-in-{group_key}"
-                lb_children_nodes = [lb_icon_id]
-                if same_group_tg_nodes:
-                    tg_row_id = f"{lb_stack_id}-tg-row"
-                    resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": same_group_tg_nodes}
-                    lb_children_nodes.append(tg_row_id)
-                resources[lb_stack_id] = {"Type": "AWS::Diagram::VerticalStack", "Title": lb_title, "Children": lb_children_nodes}
-                lb_stack_ids.append(lb_stack_id)
 
-            # Phase 2+: Add rows for NAT Gateways, TGW attachments, and orphan ENIs
+                        if str(tid).startswith('arn:aws:lambda:'):
+                            lambda_targets.append(tid)
+                        elif str(tid).startswith('i-'):
+                            ec2_targets.append(tid)
+                        else:
+                            # IP or other target
+                            ip_targets.append(target)
+
+                    # Create target sections based on what we found
+                    target_sections = []
+
+                    # ECS Clusters Section
+                    if ecs_clusters_for_tg:
+                        for cluster_node_id in ecs_clusters_for_tg:
+                            target_sections.append(cluster_node_id)
+                            logger.debug(f"Added ECS cluster {cluster_node_id} to LB {lb_id}")
+                    # Lambda Section (grouped by shared SGs)
+                    if lambda_targets:
+                        lambda_section_id = f"lambda-section-{tg_id}-in-{group_key}"
+                        lambda_nodes = []
+
+                        for lambda_id in lambda_targets:
+                            if lambda_id in self._group_parent:
+                                continue  # Already handled elsewhere
+
+                            lambda_res = self.view.filtered_resources.get(lambda_id)
+                            lambda_node_id = f"lambda-{lambda_id}-in-{group_key}"
+                            resources[lambda_node_id] = {
+                                "Type": "AWS::Lambda::Function",
+                                "Title": (lambda_res.name if lambda_res else None) or lambda_id
+                            }
+
+                            # Wrap in SGs if present
+                            lambda_wrapped = lambda_node_id
+                            if lambda_res and lambda_res.properties.get('security_group_ids'):
+                                sgs = lambda_res.properties.get('security_group_ids', [])
+                                current_container = lambda_node_id
+
+                                for sg_id in reversed(sgs):
+                                    sg_container_id = f"sg-{sg_id}-container-lambda-{lambda_id}-in-{group_key}"
+                                    sg_res = self.view.filtered_resources.get(sg_id)
+                                    sg_name = None
+                                    if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                                        sg_name = sg_res.name or sg_res.properties.get('group_name')
+
+                                    resources[sg_container_id] = {
+                                        "Type": "AWS::EC2::SecurityGroup",
+                                        "Title": f"SG: {sg_name or sg_id}",
+                                        "Children": [current_container],
+                                        "FillColor": "rgba(255,244,230,25)",
+                                        "BorderColor": "rgba(255,140,0,200)"
+                                    }
+                                    current_container = sg_container_id
+                                lambda_wrapped = current_container
+
+                            lambda_nodes.append(lambda_wrapped)
+                            self._group_parent[lambda_id] = f"lb-tg-owned-{tg_id}"
+
+                        if lambda_nodes:
+                            if len(lambda_nodes) == 1:
+                                target_sections.extend(lambda_nodes)
+                            else:
+                                resources[lambda_section_id] = {
+                                    "Type": "AWS::Diagram::HorizontalStack",
+                                    "Children": lambda_nodes
+                                }
+                                target_sections.append(lambda_section_id)
+
+                    # EC2 Section (grouped by shared SGs)
+                    if ec2_targets:
+                        ec2_section_id = f"ec2-section-{tg_id}-in-{group_key}"
+                        ec2_nodes = []
+
+                        for ec2_id in ec2_targets:
+                            if ec2_id in self._group_parent:
+                                continue  # Already handled elsewhere
+
+                            ec2_node_id = f"ec2-{ec2_id}-in-{group_key}"
+                            resources[ec2_node_id] = {"Type": "AWS::EC2::Instance", "Title": ec2_id}
+
+                            # Wrap in SGs if present
+                            ec2_res = self.view.filtered_resources.get(ec2_id)
+                            ec2_wrapped = ec2_node_id
+                            if ec2_res and ec2_res.properties.get('security_group_ids'):
+                                sgs = ec2_res.properties.get('security_group_ids', [])
+                                current_container = ec2_node_id
+
+                                for sg_id in reversed(sgs):
+                                    sg_container_id = f"sg-{sg_id}-container-ec2-{ec2_id}-in-{group_key}"
+                                    sg_res = self.view.filtered_resources.get(sg_id)
+                                    sg_name = None
+                                    if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                                        sg_name = sg_res.name or sg_res.properties.get('group_name')
+
+                                    resources[sg_container_id] = {
+                                        "Type": "AWS::EC2::SecurityGroup",
+                                        "Title": f"SG: {sg_name or sg_id}",
+                                        "Children": [current_container],
+                                        "FillColor": "rgba(255,244,230,25)",
+                                        "BorderColor": "rgba(255,140,0,200)"
+                                    }
+                                    current_container = sg_container_id
+                                ec2_wrapped = current_container
+
+                            ec2_nodes.append(ec2_wrapped)
+                            self._group_parent[ec2_id] = f"lb-tg-owned-{tg_id}"
+
+                        if ec2_nodes:
+                            if len(ec2_nodes) == 1:
+                                target_sections.extend(ec2_nodes)
+                            else:
+                                resources[ec2_section_id] = {
+                                    "Type": "AWS::Diagram::HorizontalStack",
+                                    "Children": ec2_nodes
+                                }
+                                target_sections.append(ec2_section_id)
+
+                    # IP/External Targets Section
+                    if ip_targets:
+                        ip_section_id = f"ip-section-{tg_id}-in-{group_key}"
+                        ip_nodes = []
+
+                        for target in ip_targets:
+                            ip, port = self._parse_ip_target(target)
+                            ip_node_id = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
+                            if ip_node_id not in resources:
+                                title = f"IP {ip}{(':'+str(port)) if port else ''}"
+                                resources[ip_node_id] = {"Type": "AWS::EC2::Instance", "Title": title}
+                            ip_nodes.append(ip_node_id)
+
+                        if ip_nodes:
+                            if len(ip_nodes) == 1:
+                                target_sections.extend(ip_nodes)
+                            else:
+                                resources[ip_section_id] = {
+                                    "Type": "AWS::Diagram::HorizontalStack",
+                                    "Children": ip_nodes
+                                }
+                                target_sections.append(ip_section_id)
+
+                    # Add target sections to LB (skip empty TGs)
+                    if target_sections:
+                        lb_tg_sections.extend(target_sections)
+                # Create the final LB vertical stack
+                lb_stack_id = f"lb-{lb_id}-stack-in-{group_key}"
+                lb_stack_children = [lb_wrapped_node] + lb_tg_sections
+
+                resources[lb_stack_id] = {
+                    "Type": "AWS::Diagram::VerticalStack",
+                    "Title": lb_title,
+                    "Children": lb_stack_children,
+                }
+                lb_stack_ids.append(lb_stack_id)
+                logger.debug(f"Created new LB stack {lb_stack_id} with {len(lb_tg_sections)} target sections")
+            # Handle other infrastructure rows (ENI, VPCE, NAT, TGW)
             extra_row_ids: List[str] = []
 
             # NAT Gateways row
@@ -1004,62 +1090,12 @@ class AWSLabsTransformer:
                 resources[aux_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": aux_nodes}
                 extra_row_ids.append(aux_row_id)
 
-            # Instead of BorderChildren overlays, create security group parent containers
-            # First, wrap load balancer stacks in their security group containers
-            wrapped_lb_stacks: List[str] = []
-            for lb_stack_id in lb_stack_ids:
-                # Find the corresponding load balancer ID
-                lb_id = None
-                for lb_id_candidate in lb_children:
-                    if f"lb-{lb_id_candidate}-box-in-{group_key}" == lb_stack_id:
-                        lb_id = lb_id_candidate
-                        break
-
-                if lb_id:
-                    lb = self.view.filtered_resources.get(lb_id)
-                    if lb and lb.properties.get('security_group_ids'):
-                        # Create security group container for this load balancer
-                        sgs = lb.properties.get('security_group_ids', [])
-                        current_container = lb_stack_id
-
-                        # Wrap in security group containers (innermost to outermost)
-                        for sg_id in reversed(sgs):  # Reverse to create proper nesting
-                            sg_container_id = f"sg-{sg_id}-container-{lb_id}-in-{group_node_id}"
-                            sg_res = self.view.filtered_resources.get(sg_id)
-                            sg_name = None
-                            if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
-                                sg_name = sg_res.name or sg_res.properties.get('group_name')
-
-                            resources[sg_container_id] = {
-                                "Type": "AWS::EC2::SecurityGroup",
-                                "Title": f"SG: {sg_name or sg_id}",
-                                "Children": [current_container],
-                                "FillColor": "rgba(255,244,230,25)",  # Light orange background
-                                "BorderColor": "rgba(255,140,0,200)"  # Orange border
-                            }
-                            current_container = sg_container_id
-
-                        wrapped_lb_stacks.append(current_container)
-                    else:
-                        # No security groups, use original stack
-                        wrapped_lb_stacks.append(lb_stack_id)
-                else:
-                    # Fallback if we can't find the LB ID
-                    wrapped_lb_stacks.append(lb_stack_id)
-
-            # Security groups for standalone services (ECS, Lambda, EC2) are handled
-            # when creating their respective nodes - no additional overlays needed here
+            # LB stacks already have SG wrapping built-in from the new implementation
+            wrapped_lb_stacks = lb_stack_ids[:]
 
             # Build ordered content for this group
             rows: List[str] = []
-            # 1) Cross-subnet TG stacks come first (left-justified row)
-            tg_nodes_here = self._tg_nodes_by_group.get(group_node_id, [])
-            if tg_nodes_here:
-                tg_sorted = sorted(tg_nodes_here, key=lambda nid: self._tg_meta.get(nid, ("", nid)))
-                tg_row_id = f"{group_node_id}-tg-cross-row"
-                resources[tg_row_id] = {"Type": "AWS::Diagram::HorizontalStack", "Children": tg_sorted}
-                rows.append(tg_row_id)
-            # 2) Then LB stacks (wrapped in security groups) and standalone services arranged in grid
+            # 1) LB stacks and standalone services arranged in grid
             service_nodes = wrapped_lb_stacks[:]
 
             # Add standalone ECS clusters (those not integrated into LB vertical stacks)
