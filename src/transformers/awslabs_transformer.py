@@ -1136,10 +1136,6 @@ class AWSLabsTransformer:
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in resources:  # Skip if already added
                 continue
-
-            # Skip resources that have been assigned to a parent by logical subnet grouping
-            if resource_id in self._group_parent:
-                continue
                 
             service_type = self.RESOURCE_TYPE_MAPPING.get(
                 resource.resource_type, 
@@ -1166,6 +1162,11 @@ class AWSLabsTransformer:
                 continue
 
             elif resource.resource_type == ResourceType.ECS_SERVICE:
+                # Skip ECS services that have target groups - they should be handled by TG clustering logic
+                has_tgs = bool(resource.properties.get('target_group_arns'))
+                if has_tgs:
+                    continue
+
                 # Append backend ENI IPs under the service title when available
                 title = resource.name or resource_id
                 ips = self._get_service_backend_ips(resource_id)
