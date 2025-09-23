@@ -426,16 +426,30 @@ class AWSLabsTransformerV2(BaseTransformer):
 
     def _should_skip_awslabs_resource(self, node: GraphNode) -> bool:
         """
-        Apply V1-style filtering for AWS Labs compatibility.
+        Apply aggressive filtering to only include DAC-supported resource types.
 
-        This mimics the filtering logic from the original AWS Labs transformer
-        to ensure we only include resources that should be rendered.
+        DAC only supports a limited set of AWS resource types. All others must be filtered out
+        to prevent warnings and unknown resource errors.
         """
         if not node.resource_type:
             return True
 
+        # ONLY include these DAC-supported resource types (from working examples)
+        dac_supported_types = {
+            ResourceType.VPC,
+            ResourceType.SUBNET,
+            ResourceType.INTERNET_GATEWAY,
+            ResourceType.NAT_GATEWAY,
+            ResourceType.EC2_INSTANCE,
+            ResourceType.LOAD_BALANCER,  # AWS::ElasticLoadBalancingV2::LoadBalancer
+        }
+
+        # Skip all resources that are not explicitly supported by DAC
+        if node.resource_type not in dac_supported_types:
+            return True
+
+        # Additional filtering for specific architectural cases
         # Skip subnets when logical grouping is enabled (they become containers)
-        # Access logical_subnets_enabled from the base transformer
         logical_subnets_enabled = getattr(self, 'logical_subnets_enabled', True)
         if node.resource_type == ResourceType.SUBNET and logical_subnets_enabled:
             return True
@@ -443,16 +457,6 @@ class AWSLabsTransformerV2(BaseTransformer):
         # Skip load balancers as standalone nodes (handled by logical subnet stacks)
         if node.resource_type == ResourceType.LOAD_BALANCER:
             return True
-
-        # Skip target groups as standalone nodes (not user-visible components)
-        if node.resource_type == ResourceType.TARGET_GROUP:
-            return True
-
-        # Skip ECS services that have target groups (handled by LB/TG clustering)
-        if node.resource_type == ResourceType.ECS_SERVICE:
-            has_tgs = bool(node.properties.get('target_group_arns'))
-            if has_tgs:
-                return True
 
         return False
 
