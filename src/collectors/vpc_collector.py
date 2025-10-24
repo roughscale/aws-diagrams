@@ -61,7 +61,8 @@ class VPCCollector(BaseCollector):
             'ec2:DescribeTransitGateways',
             'ec2:DescribeTransitGatewayAttachments',
             'ec2:DescribeTransitGatewayVpcAttachments',
-            'ec2:DescribeNetworkInterfaces'
+            'ec2:DescribeNetworkInterfaces',
+            'ec2:DescribeTags'
         ]
     
     def collect_resources(self) -> None:
@@ -107,6 +108,14 @@ class VPCCollector(BaseCollector):
 
                     tags = {}
                     tags_list = ni.get('TagSet', []) or ni.get('Tags', []) or []
+                    if not tags_list:
+                        try:
+                            tag_resp = self._make_api_call(ec2_client, 'describe_tags',
+                                                            Filters=[{'Name': 'resource-id', 'Values': [eni_id]}])
+                            if tag_resp:
+                                tags_list = tag_resp.get('Tags', []) or []
+                        except Exception as tag_error:
+                            logger.debug(f"Could not retrieve tags for ENI {eni_id}: {tag_error}")
                     name = None
                     for tag in tags_list:
                         if tag.get('Key') == 'Name':
@@ -143,6 +152,14 @@ class VPCCollector(BaseCollector):
                             source_id=subnet_id,
                             target_id=eni_id,
                             relationship_type=RelationshipType.CONTAINS
+                        ))
+
+                    lambda_arn = tags.get('aws:lambda:functionArn')
+                    if lambda_arn:
+                        self.add_relationship(Relationship(
+                            source_id=eni_id,
+                            target_id=lambda_arn,
+                            relationship_type=RelationshipType.ATTACHED_TO
                         ))
         except Exception as e:
             error_msg = f"Failed to collect Network Interfaces: {e}"
@@ -641,9 +658,18 @@ class VPCCollector(BaseCollector):
                     relationship_type=RelationshipType.CONTAINS
                 )
                 self.add_relationship(vpc_relationship)
-                
+
+                # Link ENIs to the VPC endpoint for deterministic mapping
+                for eni_id in endpoint_resource.properties.get('network_interface_ids', []) or []:
+                    if eni_id:
+                        self.add_relationship(Relationship(
+                            source_id=eni_id,
+                            target_id=endpoint_id,
+                            relationship_type=RelationshipType.ATTACHED_TO
+                        ))
+
                 logger.debug(f"Collected VPC Endpoint: {endpoint_id}")
-                
+
         except Exception as e:
             error_msg = f"Failed to collect VPC Endpoints: {e}"
             logger.error(error_msg)

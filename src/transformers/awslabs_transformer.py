@@ -9,6 +9,7 @@ AWS Labs diagram-as-code format: https://github.com/awslabs/diagram-as-code
 
 from typing import Dict, List, Any, Optional, Set, Tuple
 import math
+import re
 from dataclasses import dataclass
 import logging
 
@@ -109,6 +110,9 @@ class AWSLabsTransformer:
         self._lb_tg_links: Set[Tuple[str, str]] = set()
         self._tg_nodes_by_group: Dict[str, List[str]] = {}
         self._tg_meta: Dict[str, Tuple[str, str]] = {}  # tg_node_id -> (lb_title, tg_title)
+        self._eni_instance_map: Dict[str, str] = {}
+        self._vpce_eni_owner_cache: Dict[str, Tuple[BaseResource, str]] = {}
+        self._vpce_eni_cache_populated = False
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -506,9 +510,9 @@ class AWSLabsTransformer:
                             "Children": [resource_id] + peer_vpcs
                         }
                         # Replace the VPC with panel in top-level VPCs stack
-                    if "VPCsStack" in resources:
-                        children = resources["VPCsStack"].get("Children", [])
-                        resources["VPCsStack"]["Children"] = [panel_id if c == resource_id else c for c in children]
+                        if "VPCsStack" in resources:
+                            children = resources["VPCsStack"].get("Children", [])
+                            resources["VPCsStack"]["Children"] = [panel_id if c == resource_id else c for c in children]
 
     def _create_logical_subnet_groups(self, vpc_id: str, resources: Dict[str, Any]) -> List[str]:
         """Synthesize logical Subnet nodes that aggregate subnets across AZs.
@@ -525,6 +529,35 @@ class AWSLabsTransformer:
                 group = self._get_subnet_logical_group(res)
                 group_to_subnets.setdefault(group, []).append(rid)
 
+        # Map ENI ids to their owning EC2 instances
+        eni_to_instance: Dict[str, str] = {}
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.ATTACHED_TO:
+                continue
+            src = self.view.filtered_resources.get(rel.source_id)
+            tgt = self.view.filtered_resources.get(rel.target_id)
+            if not src or not tgt:
+                continue
+            if (src.resource_type == ResourceType.NETWORK_INTERFACE and
+                    tgt.resource_type == ResourceType.EC2_INSTANCE):
+                eni_to_instance[src.resource_id] = tgt.resource_id
+
+        for rid, res in self.view.filtered_resources.items():
+            if res.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            attachment = (res.properties or {}).get('attachment') or {}
+            instance_id = (
+                attachment.get('InstanceId')
+                or attachment.get('instanceId')
+                or attachment.get('instance_id')
+            )
+            if instance_id:
+                eni_to_instance.setdefault(rid, str(instance_id))
+
+        self._eni_instance_map = eni_to_instance.copy()
+
+        synthetic_instances: Dict[str, BaseResource] = {}
+        lb_owned_instances: Set[str] = set(eni_to_instance.values())
         additions: List[str] = []
         # Precompute Lambda targets from all TGs to avoid multi-parenting
         tg_lambda_target_ids: set = set()
@@ -758,6 +791,24 @@ class AWSLabsTransformer:
                         if parent is None:
                             self._group_parent[rid] = group_node_id
                             svc_children.append(rid)
+                elif res.resource_type == ResourceType.EC2_INSTANCE:
+                    if res.resource_id in lb_owned_instances:
+                        logger.debug(f"Skipping standalone placement for LB-owned EC2 {res.resource_id}")
+                        continue
+                    props = res.properties or {}
+                    subnet_id = props.get('subnet_id')
+                    if not subnet_id:
+                        # Fall back to primary ENI subnet when available
+                        for eni_id in props.get('network_interface_ids', []) or []:
+                            eni_res = self.view.filtered_resources.get(eni_id)
+                            if eni_res and eni_res.properties.get('subnet_id'):
+                                subnet_id = eni_res.properties.get('subnet_id')
+                                break
+                    if subnet_id and subnet_id in subnet_set:
+                        parent = self._group_parent.get(rid)
+                        if parent is None:
+                            self._group_parent[rid] = group_node_id
+                            svc_children.append(rid)
                 elif res.resource_type == ResourceType.LOAD_BALANCER:
                     lb_subnets = set(res.properties.get('subnet_ids') or [])
                     if lb_subnets & subnet_set:
@@ -804,6 +855,7 @@ class AWSLabsTransformer:
             for lb_id in lb_children:
                 lb_res = self.view.filtered_resources.get(lb_id)
                 lb_title = (lb_res.name if lb_res else None) or lb_id
+                lb_common_sgs: Dict[str, List[str]] = {}
 
                 # Create the base LB node
                 lb_node_id = f"lb-{lb_id}-in-{group_key}"
@@ -873,7 +925,19 @@ class AWSLabsTransformer:
                             ec2_targets.append(tid)
                         else:
                             # IP or other target
-                            ip_targets.append(target)
+                            ip_str, _ = self._parse_ip_target(target)
+                            mapped_svc = self._find_service_id_by_ip(ip_str)
+                            mapped_res = self.view.filtered_resources.get(mapped_svc) if mapped_svc else None
+                            mapped_type = mapped_res.resource_type if mapped_res else None
+                            if not mapped_type and mapped_svc and str(mapped_svc).startswith('i-'):
+                                mapped_type = ResourceType.EC2_INSTANCE
+
+                            if mapped_svc and mapped_type == ResourceType.EC2_INSTANCE:
+                                if mapped_svc not in ec2_targets:
+                                    ec2_targets.append(mapped_svc)
+                                self._group_parent.setdefault(mapped_svc, group_node_id)
+                            else:
+                                ip_targets.append(target)
 
                     # Create target sections based on what we found
                     target_sections = []
@@ -941,9 +1005,22 @@ class AWSLabsTransformer:
                         ec2_section_id = f"ec2-section-{tg_id}-in-{group_key}"
                         ec2_nodes = []
 
+                        target_sg_map: Dict[str, List[str]] = {}
+                        sg_sets: List[Set[str]] = []
                         for ec2_id in ec2_targets:
-                            if ec2_id in self._group_parent:
-                                logger.debug(f"Skipping EC2 {ec2_id} - already in group parent")
+                            ec2_res = self.view.filtered_resources.get(ec2_id)
+                            sgs = self._extract_security_group_ids(ec2_res.properties) if ec2_res else []
+                            target_sg_map[ec2_id] = sgs
+                            if sgs:
+                                sg_sets.append(set(sgs))
+
+                        common_sgs: Set[str] = set.intersection(*sg_sets) if sg_sets else set()
+                        common_sgs = {sg for sg in common_sgs if sg}
+
+                        for ec2_id in ec2_targets:
+                            parent = self._group_parent.get(ec2_id)
+                            if parent is not None and parent != group_node_id:
+                                logger.debug(f"Skipping EC2 {ec2_id} - already owned by {parent}")
                                 continue  # Already handled elsewhere
 
                             logger.debug(f"Creating EC2 node for {ec2_id}")
@@ -977,11 +1054,12 @@ class AWSLabsTransformer:
                                 else:
                                     logger.warning(f"EC2 instance {ec2_id} not found in any account/region in topology")
                             ec2_wrapped = ec2_node_id
-                            if ec2_res and ec2_res.properties.get('security_group_ids'):
-                                sgs = ec2_res.properties.get('security_group_ids', [])
+                            sgs = target_sg_map.get(ec2_id, [])
+                            specific_sgs = [sg for sg in sgs if sg not in common_sgs]
+                            if specific_sgs:
                                 current_container = ec2_node_id
 
-                                for sg_id in reversed(sgs):
+                                for sg_id in reversed(specific_sgs):
                                     sg_container_id = f"sg-{sg_id}-container-ec2-{ec2_id}-in-{group_key}"
                                     sg_res = self.view.filtered_resources.get(sg_id)
                                     sg_name = None
@@ -1003,13 +1081,19 @@ class AWSLabsTransformer:
 
                         if ec2_nodes:
                             if len(ec2_nodes) == 1:
-                                target_sections.extend(ec2_nodes)
+                                nodes_to_attach = ec2_nodes
                             else:
                                 resources[ec2_section_id] = {
                                     "Type": "AWS::Diagram::HorizontalStack",
                                     "Children": ec2_nodes
                                 }
-                                target_sections.append(ec2_section_id)
+                                nodes_to_attach = [ec2_section_id]
+
+                            if common_sgs:
+                                for sg_id in common_sgs:
+                                    lb_common_sgs.setdefault(sg_id, []).extend(nodes_to_attach)
+                            else:
+                                target_sections.extend(nodes_to_attach)
 
                     # IP/External Targets Section
                     if ip_targets:
@@ -1020,16 +1104,29 @@ class AWSLabsTransformer:
                             ip, port = self._parse_ip_target(target)
                             logger.debug(f"Processing IP target {ip}:{port}")
 
-                            # Check if this IP maps to a known service already included
                             mapped_svc = self._find_service_id_by_ip(ip)
                             if mapped_svc:
-                                logger.debug(f"IP {ip} maps to service {mapped_svc}")
+                                mapped_res = self.view.filtered_resources.get(mapped_svc)
+                                mapped_type = mapped_res.resource_type if mapped_res else None
+                                if not mapped_type and str(mapped_svc).startswith('i-'):
+                                    mapped_type = ResourceType.EC2_INSTANCE
+
+                                logger.debug(f"IP {ip} maps to service {mapped_svc} (type={mapped_type})")
+
+                                if mapped_type == ResourceType.EC2_INSTANCE:
+                                    if mapped_svc not in ec2_targets:
+                                        ec2_targets.append(mapped_svc)
+                                    self._group_parent.setdefault(mapped_svc, group_node_id)
+                                    logger.debug(f"Promoted IP target {ip} to EC2 instance {mapped_svc}")
+                                    continue
+
                                 if mapped_svc in self._group_parent:
                                     # Skip this IP - the service is already rendered in the diagram somewhere
-                                    logger.debug(f"Skipping IP {ip} - service {mapped_svc} already handled (parent: {self._group_parent[mapped_svc]})")
+                                    logger.debug(
+                                        f"Skipping IP {ip} - service {mapped_svc} already handled (parent: {self._group_parent[mapped_svc]})"
+                                    )
                                     continue
-                                else:
-                                    logger.debug(f"IP {ip} maps to service {mapped_svc} but service not in group_parent - will render IP")
+                                logger.debug(f"IP {ip} maps to service {mapped_svc} but service not in group_parent - will render IP icon")
                             else:
                                 logger.debug(f"IP {ip} does not map to any known service - will render IP")
 
@@ -1052,6 +1149,25 @@ class AWSLabsTransformer:
                     # Add target sections to LB (skip empty TGs)
                     if target_sections:
                         lb_tg_sections.extend(target_sections)
+
+                for sg_id, child_nodes in lb_common_sgs.items():
+                    if not child_nodes:
+                        continue
+                    unique_children = list(dict.fromkeys(child_nodes))
+                    container_id = f"sg-{sg_id}-common-container-{lb_id}-in-{group_key}"
+                    sg_res = self.view.filtered_resources.get(sg_id)
+                    sg_name = None
+                    if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                        sg_name = sg_res.name or sg_res.properties.get('group_name')
+                    resources[container_id] = {
+                        "Type": "AWS::EC2::SecurityGroup",
+                        "Title": f"SG: {sg_name or sg_id}",
+                        "Children": unique_children,
+                        "FillColor": "rgba(255,244,230,25)",
+                        "BorderColor": "rgba(255,140,0,200)"
+                    }
+                    lb_tg_sections.append(container_id)
+
                 # Create the final LB vertical stack
                 lb_stack_id = f"lb-{lb_id}-stack-in-{group_key}"
                 lb_stack_children = [lb_wrapped_node] + lb_tg_sections
@@ -1119,10 +1235,12 @@ class AWSLabsTransformer:
                     if not (ep_subnets & subnet_set):
                         continue
                     service_name = self._get_vpc_endpoint_service(res2)
-                    owner = (res2.properties.get('service_owner') or '').lower()
+                    owner_raw = res2.properties.get('service_owner') or ''
+                    is_aws_managed = self._is_aws_managed_vpce(res2, owner_raw)
+                    owner = owner_raw.lower()
                     # If AWS-owned, map to service icon; else use VPCE node with owner note
                     node_id = f"{rid2}-in-{group_node_id}"
-                    if owner == 'amazon':
+                    if is_aws_managed:
                         mapped = self._vpce_service_icon(res2.properties.get('service_name') or '')
                         if mapped:
                             svc_type, svc_title = mapped
@@ -1197,11 +1315,18 @@ class AWSLabsTransformer:
                                 service_eni_ids.add(eni.resource_id)
 
             eni_ids: List[str] = []
+            group_instance_ids: Set[str] = set()
             for rid2, res2 in self.view.filtered_resources.items():
                 if res2.resource_type == ResourceType.NETWORK_INTERFACE and res2.properties.get('subnet_id') in subnet_set:
                     desc = (res2.properties.get('description') or '').lower()
                     sgs = set(res2.properties.get('security_group_ids') or [])
                     iface_type = (res2.properties.get('interface_type') or '').lower()
+                    if rid2 in eni_to_instance:
+                        group_instance_ids.add(eni_to_instance[rid2])
+                        continue
+                    vpce_info = self._get_vpce_for_eni(rid2)
+                    if vpce_info and self._is_aws_managed_vpce(vpce_info[0], vpce_info[1]):
+                        continue
                     # Heuristics: skip ENIs for VPCE, ECS-owned, LB-owned, Lambda ENIs, NAT ENIs, TGW ENIs, and aggregated services
                     if (
                         res2.resource_id in vpce_eni_ids or
@@ -1220,6 +1345,38 @@ class AWSLabsTransformer:
                     ):
                         continue
                     eni_ids.append(rid2)
+
+            # Ensure LB-owned EC2 instances mapped from ENIs appear in the group
+            for instance_id in sorted(group_instance_ids):
+                if self._group_parent.get(instance_id):
+                    continue
+                instance_resource = self.view.filtered_resources.get(instance_id)
+                if not instance_resource:
+                    instance_resource = synthetic_instances.get(instance_id)
+                    if not instance_resource:
+                        instance_info = self._find_ec2_in_full_topology(instance_id, vpc_id)
+                        if instance_info:
+                            instance_resource = instance_info['resource']
+                            synthetic_instances[instance_id] = instance_resource
+                if instance_resource:
+                    # Ensure security group IDs are normalized
+                    props = instance_resource.properties or {}
+                    if 'security_group_ids' not in props and props.get('security_groups'):
+                        sg_ids = []
+                        for entry in props.get('security_groups') or []:
+                            if isinstance(entry, dict):
+                                sg_id = entry.get('GroupId') or entry.get('group_id') or entry.get('id')
+                                if sg_id:
+                                    sg_ids.append(str(sg_id))
+                            elif entry:
+                                sg_ids.append(str(entry))
+                        if sg_ids:
+                            instance_resource.properties = dict(props)
+                            instance_resource.properties['security_group_ids'] = sg_ids
+                    self.view.filtered_resources.setdefault(instance_id, instance_resource)
+                    self._group_parent[instance_id] = group_node_id
+                    if instance_id not in svc_children:
+                        svc_children.append(instance_id)
             # Combine VPCE and ENIs into a single auxiliary row (keeps service grid clean)
             aux_nodes = vpce_nodes + eni_ids
             if aux_nodes:
@@ -1260,32 +1417,33 @@ class AWSLabsTransformer:
             # Wrap standalone services in their security groups too
             for rid in svc_children:
                 resource = self.view.filtered_resources.get(rid)
-                if resource and hasattr(resource, 'properties') and resource.properties.get('security_group_ids'):
+                if resource and hasattr(resource, 'properties'):
                     # Wrap this service in security group containers
-                    sgs = resource.properties.get('security_group_ids', [])
-                    current_container = rid
+                    sgs = self._extract_security_group_ids(resource.properties)
+                    if sgs:
+                        current_container = rid
 
-                    # Wrap in security group containers (innermost to outermost)
-                    for sg_id in reversed(sgs):  # Reverse to create proper nesting
-                        sg_container_id = f"sg-{sg_id}-container-{rid}-in-{group_node_id}"
-                        sg_res = self.view.filtered_resources.get(sg_id)
-                        sg_name = None
-                        if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
-                            sg_name = sg_res.name or sg_res.properties.get('group_name')
+                        # Wrap in security group containers (innermost to outermost)
+                        for sg_id in reversed(sgs):  # Reverse to create proper nesting
+                            sg_container_id = f"sg-{sg_id}-container-{rid}-in-{group_node_id}"
+                            sg_res = self.view.filtered_resources.get(sg_id)
+                            sg_name = None
+                            if sg_res and getattr(sg_res, 'resource_type', None) == ResourceType.SECURITY_GROUP:
+                                sg_name = sg_res.name or sg_res.properties.get('group_name')
 
-                        resources[sg_container_id] = {
-                            "Type": "AWS::EC2::SecurityGroup",
-                            "Title": f"SG: {sg_name or sg_id}",
-                            "Children": [current_container],
-                            "FillColor": "rgba(255,244,230,25)",  # Light orange background
-                            "BorderColor": "rgba(255,140,0,200)"  # Orange border
-                        }
-                        current_container = sg_container_id
+                            resources[sg_container_id] = {
+                                "Type": "AWS::EC2::SecurityGroup",
+                                "Title": f"SG: {sg_name or sg_id}",
+                                "Children": [current_container],
+                                "FillColor": "rgba(255,244,230,25)",  # Light orange background
+                                "BorderColor": "rgba(255,140,0,200)"  # Orange border
+                            }
+                            current_container = sg_container_id
 
-                    service_nodes.append(current_container)
-                else:
-                    # No security groups, use original service
-                    service_nodes.append(rid)
+                        service_nodes.append(current_container)
+                        continue
+                # No security groups, use original service
+                service_nodes.append(rid)
             grid_rows = self._grid_stack(resources, f"{group_node_id}-grid", service_nodes)
             rows.extend(grid_rows or service_nodes)
             # 3) Then aux rows (VPCE/ENIs/NAT/TGW)
@@ -1368,6 +1526,11 @@ class AWSLabsTransformer:
                 resource_def["Title"] = self._format_title_with_ips(title, ips)
 
             elif resource.resource_type == ResourceType.NETWORK_INTERFACE:
+                if resource_id in self._eni_instance_map:
+                    continue
+                vpce_info = self._get_vpce_for_eni(resource_id)
+                if vpce_info and self._is_aws_managed_vpce(vpce_info[0], vpce_info[1]):
+                    continue  # Service icon rendered via VPCE node; skip raw ENI
                 # Show ENI private IP beneath the title
                 title = resource.name or resource_id
                 ip = (resource.properties or {}).get('private_ip')
@@ -1587,12 +1750,28 @@ class AWSLabsTransformer:
         ECS_SERVICE or LAMBDA_FUNCTION.
         """
         eni_id = None
+        eni_resource: Optional[BaseResource] = None
         for rid, res in self.view.filtered_resources.items():
             if getattr(res, 'resource_type', None) == ResourceType.NETWORK_INTERFACE and (res.properties or {}).get('private_ip') == ip:
                 eni_id = rid
+                eni_resource = res
                 break
         if not eni_id:
             return None
+        if eni_resource:
+            attachment = (eni_resource.properties or {}).get('attachment') or {}
+            instance_id = (
+                attachment.get('InstanceId')
+                or attachment.get('instance_id')
+                or attachment.get('instanceId')
+            )
+            if instance_id:
+                return instance_id
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type == RelationshipType.ATTACHED_TO and rel.source_id == eni_id:
+                tgt = self.view.filtered_resources.get(rel.target_id)
+                if tgt and tgt.resource_type == ResourceType.EC2_INSTANCE:
+                    return tgt.resource_id
         for rel in self.view.filtered_relationships:
             if rel.relationship_type != RelationshipType.MEMBER_OF:
                 continue
@@ -1622,6 +1801,25 @@ class AWSLabsTransformer:
         # Fallback for other formats
         return str(tid), port
 
+    def _extract_security_group_ids(self, properties: Dict[str, Any]) -> List[str]:
+        """Normalize security group identifiers from resource properties."""
+        if not properties:
+            return []
+        sg_ids = properties.get('security_group_ids') or []
+        if sg_ids:
+            return list(sg_ids)
+
+        raw_groups = properties.get('security_groups') or []
+        normalized: List[str] = []
+        for entry in raw_groups:
+            if isinstance(entry, dict):
+                sg_id = entry.get('GroupId') or entry.get('group_id') or entry.get('id')
+                if sg_id:
+                    normalized.append(str(sg_id))
+            elif entry:
+                normalized.append(str(entry))
+        return normalized
+
     def _get_vpce_service_id(self, service_name: str) -> Optional[str]:
         """Extract the vpce service id (vpce-svc-*) from a full service name."""
         if not service_name:
@@ -1630,6 +1828,59 @@ class AWSLabsTransformer:
             if token.lower().startswith('vpce-svc-'):
                 return token.upper()
         return None
+
+    def _ensure_vpce_eni_cache(self) -> None:
+        if self._vpce_eni_cache_populated:
+            return
+        cache: Dict[str, Tuple[BaseResource, str]] = {}
+        for res in self.view.filtered_resources.values():
+            if res.resource_type != ResourceType.VPC_ENDPOINT:
+                continue
+            owner = res.properties.get('service_owner') or ''
+            for eni_id in res.properties.get('network_interface_ids') or []:
+                cache[str(eni_id)] = (res, owner)
+
+        # Fallback: map ENIs via description/attachment if VPCE resource omitted network_interface_ids
+        vpce_pattern = re.compile(r'vpce-[0-9a-f]+', re.IGNORECASE)
+        for res in self.view.filtered_resources.values():
+            if res.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            eni_id = res.resource_id
+            if eni_id in cache:
+                continue
+            props = res.properties or {}
+            desc = props.get('description') or ''
+            match = vpce_pattern.search(str(desc))
+            if not match:
+                attachment = props.get('attachment') or {}
+                for value in attachment.values():
+                    if isinstance(value, str):
+                        match = vpce_pattern.search(value)
+                        if match:
+                            break
+            if not match:
+                continue
+            vpce_id = match.group(0)
+            vpce_resource = self.view.filtered_resources.get(vpce_id)
+            owner = ''
+            if vpce_resource:
+                owner = vpce_resource.properties.get('service_owner') or ''
+            cache[eni_id] = (vpce_resource, owner)
+        self._vpce_eni_owner_cache = cache
+        self._vpce_eni_cache_populated = True
+
+    def _get_vpce_for_eni(self, eni_id: str) -> Optional[Tuple[BaseResource, str]]:
+        self._ensure_vpce_eni_cache()
+        return self._vpce_eni_owner_cache.get(eni_id)
+
+    def _is_aws_managed_vpce(self, vpce_resource: BaseResource, owner: str) -> bool:
+        service_name = (vpce_resource.properties or {}).get('service_name', '')
+        owner_normalized = (owner or '').strip().lower()
+        if owner_normalized in {'amazon', 'aws', 'amazon web services', 'amazon web services, inc.'}:
+            return True
+        if service_name and service_name.lower().startswith('com.amazonaws.'):
+            return True
+        return False
 
     def _vpce_service_icon(self, service_name: str) -> Optional[Tuple[str, str]]:
         """Map a VPC endpoint AWS service name to a DAC service type and friendly title.

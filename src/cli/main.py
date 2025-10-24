@@ -138,6 +138,7 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
     # Import here to avoid circular imports
     try:
         from ..collectors.vpc_collector import VPCCollector
+        from ..collectors.ec2_collector import EC2Collector
         # Optional collectors
         try:
             from ..collectors.ecs_collector import ECSCollector  # type: ignore
@@ -175,6 +176,7 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from topology.serializer import TopologyYAMLSerializer
     except ImportError:
         from collectors.vpc_collector import VPCCollector
+        from collectors.ec2_collector import EC2Collector
         try:
             from collectors.ecs_collector import ECSCollector  # type: ignore
         except Exception:
@@ -300,7 +302,8 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             
             # Determine which collectors to run
             available_collectors = {
-                'vpc': VPCCollector
+                'vpc': VPCCollector,
+                'ec2': EC2Collector,
             }
             if 'ECSCollector' in locals() and ECSCollector:
                 available_collectors['ecs'] = ECSCollector  # type: ignore

@@ -7,6 +7,7 @@ each implementing the BaseCollector interface for consistent data gathering.
 
 from .base_collector import BaseCollector, CollectionError, RateLimitError
 from .vpc_collector import VPCCollector
+from .ec2_collector import EC2Collector
 from .ecs_collector import ECSCollector
 from .elbv2_collector import ELBV2Collector
 from .lambda_collector import LambdaCollector
@@ -20,6 +21,7 @@ __all__ = [
     'CollectionError',
     'RateLimitError',
     'VPCCollector',
+    'EC2Collector',
     'ECSCollector',
     'ELBV2Collector',
     'LambdaCollector',

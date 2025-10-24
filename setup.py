@@ -56,7 +56,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "aws-topology=cli.main:cli",
+            "aws-topology=src.cli.main:cli",
+            "aws-topology-report=src.cli.report:cli",
         ],
     },
     include_package_data=True,

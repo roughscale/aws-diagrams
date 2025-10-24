@@ -1,7 +1,13 @@
-"""
-Command-line interface for AWS topology discovery and diagram generation.
-"""
+"""Command-line interface entry points for AWS topology tooling."""
 
-from .main import cli
+from .main import cli as topology_cli
+from .report import cli as report_cli
 
-__all__ = ['cli']
+# Preserve the original name for backwards compatibility
+cli = topology_cli
+
+__all__ = [
+    "cli",
+    "topology_cli",
+    "report_cli",
+]

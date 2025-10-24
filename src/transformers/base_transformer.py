@@ -123,7 +123,18 @@ class BaseTransformer(ABC):
 
     def _collect_service_eni_ids(self) -> Set[str]:
         """Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)."""
-        service_eni_ids = set()
+        service_eni_ids: Set[str] = set()
+
+        # Map VPC endpoint ownership for deterministic ENI filtering
+        vpce_owner_map: Dict[str, Tuple[str, str]] = {}
+        lambda_ids: Set[str] = set()
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type == ResourceType.VPC_ENDPOINT:
+                owner = (resource.properties.get('service_owner') or '').lower()
+                service_name = (resource.properties.get('service_name') or '').lower()
+                vpce_owner_map[resource_id] = (owner, service_name)
+            elif resource.resource_type == ResourceType.LAMBDA_FUNCTION:
+                lambda_ids.add(resource_id)
 
         for resource_id, resource in self.view.filtered_resources.items():
             if resource.resource_type in [
@@ -144,6 +155,55 @@ class BaseTransformer(ABC):
                         eni = self.view.filtered_resources.get(rel.source_id)
                         if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
                             service_eni_ids.add(eni.resource_id)
+
+        # Deterministically include ENIs attached to AWS-managed VPC endpoints or Lambda functions
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.ATTACHED_TO:
+                continue
+            eni_resource = self.view.filtered_resources.get(rel.source_id)
+            if not eni_resource or eni_resource.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            if rel.target_id in lambda_ids:
+                logger.debug(f"Service ENI detected via Lambda relationship: {eni_resource.resource_id} -> {rel.target_id}")
+                service_eni_ids.add(eni_resource.resource_id)
+                continue
+            vpce_info = vpce_owner_map.get(rel.target_id)
+            if vpce_info:
+                owner, service_name = vpce_info
+                if owner in {'amazon', 'aws', 'amazon web services', 'amazon web services, inc.'} or service_name.startswith('com.amazonaws.'):
+                    logger.debug(f"Service ENI detected via VPCE relationship: {eni_resource.resource_id} -> {rel.target_id} (owner={owner}, service={service_name})")
+                    service_eni_ids.add(eni_resource.resource_id)
+
+        # Include ENIs whose metadata tags identify managed services (RDS, Lambda, etc.)
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            attachment = (resource.properties or {}).get('attachment') or {}
+            owner = str(attachment.get('InstanceOwnerId', '')).lower()
+            tags = resource.metadata.tags or {}
+
+            if owner in {'amazon-rds'}:
+                logger.debug(f"Service ENI detected via owner: {resource_id} owner={owner}")
+                service_eni_ids.add(resource_id)
+                continue
+
+            desc = (resource.properties or {}).get('description', '')
+            desc_lower = str(desc).lower()
+            if any(keyword in desc_lower for keyword in [
+                'rdsnetworkinterface',
+                'rds-',
+                'aurora',
+                'elasticache',
+                'redis',
+                'memcached',
+                'redshift',
+                'opensearch',
+                'elasticsearch'
+            ]):
+                logger.debug(f"Service ENI detected via description: {resource_id} desc={desc}")
+                service_eni_ids.add(resource_id)
+            else:
+                logger.debug(f"Non-service ENI retained: {resource_id} owner={owner} desc={desc} tags={tags}")
 
         return service_eni_ids
 

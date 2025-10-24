@@ -5,15 +5,15 @@ This module transforms generic graph representations into draw.io XML format
 with proper AWS icon support, hierarchical grouping, and automatic layout.
 """
 
+# Use the standard library ElementTree for XML generation. The defusedxml
+# variant does not expose construction helpers like Element/SubElement which
+# this module relies on when building diagrams from scratch.
+import xml.etree.ElementTree as ET
+
 try:
-    from defusedxml import ElementTree as ET
-    from defusedxml import minidom
+    from defusedxml import minidom  # type: ignore
 except ImportError:
-    # Fallback to standard library with warning
-    import xml.etree.ElementTree as ET
     from xml.dom import minidom
-    import warnings
-    warnings.warn("defusedxml not available, using potentially insecure XML parsing", UserWarning)
 
 import base64
 import zlib
