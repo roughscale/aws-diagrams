@@ -12,19 +12,51 @@ import math
 
 try:
     from ..views.view_engine import TopologyView
-    from ..topology.schema import ResourceType, BaseResource, Relationship, RelationshipType
+    from ..topology.schema import (
+        ResourceType,
+        BaseResource,
+        Relationship,
+        RelationshipType,
+    )
     from ..utils.logger import get_logger
     from .graph_model import (
-        DiagramGraph, GraphNode, GraphEdge, GraphContainer, Style, Position,
-        NodeType, LayoutType, DiagramMetadata
+        DiagramGraph,
+        GraphNode,
+        GraphEdge,
+        GraphContainer,
+        Style,
+        Position,
+        NodeType,
+        LayoutType,
+        DiagramMetadata,
+    )
+    from ..utils.eni_inference import (
+        extract_elb_identifier,
+        resolve_load_balancer_identifier,
     )
 except ImportError:
     from views.view_engine import TopologyView
-    from topology.schema import ResourceType, BaseResource, Relationship, RelationshipType
+    from topology.schema import (
+        ResourceType,
+        BaseResource,
+        Relationship,
+        RelationshipType,
+    )
     from utils.logger import get_logger
     from transformers.graph_model import (
-        DiagramGraph, GraphNode, GraphEdge, GraphContainer, Style, Position,
-        NodeType, LayoutType, DiagramMetadata
+        DiagramGraph,
+        GraphNode,
+        GraphEdge,
+        GraphContainer,
+        Style,
+        Position,
+        NodeType,
+        LayoutType,
+        DiagramMetadata,
+    )
+    from utils.eni_inference import (
+        extract_elb_identifier,
+        resolve_load_balancer_identifier,
     )
 
 logger = get_logger("base_transformer")
@@ -61,7 +93,7 @@ class BaseTransformer(ABC):
         ResourceType.LAMBDA_FUNCTION: "lambda_function",
         ResourceType.TRANSIT_GATEWAY: "transit_gateway",
         ResourceType.VPC_PEERING: "vpc_peering",
-        ResourceType.NETWORK_INTERFACE: "network_interface"
+        ResourceType.NETWORK_INTERFACE: "network_interface",
     }
 
     def __init__(self, view: TopologyView):
@@ -74,7 +106,7 @@ class BaseTransformer(ABC):
             description=view.description,
             source_view=view.name,
             generator=self.__class__.__name__,
-            version="1.0"
+            version="1.0",
         )
 
         # Transformation state tracking
@@ -87,8 +119,11 @@ class BaseTransformer(ABC):
 
     def _extract_primary_vpc_id(self) -> Optional[str]:
         """Extract the primary VPC ID from the view."""
-        vpc_ids = [rid for rid, res in self.view.filtered_resources.items()
-                  if res.resource_type == ResourceType.VPC]
+        vpc_ids = [
+            rid
+            for rid, res in self.view.filtered_resources.items()
+            if res.resource_type == ResourceType.VPC
+        ]
         return vpc_ids[0] if len(vpc_ids) == 1 else None
 
     def create_graph(self) -> DiagramGraph:
@@ -130,8 +165,8 @@ class BaseTransformer(ABC):
         lambda_ids: Set[str] = set()
         for resource_id, resource in self.view.filtered_resources.items():
             if resource.resource_type == ResourceType.VPC_ENDPOINT:
-                owner = (resource.properties.get('service_owner') or '').lower()
-                service_name = (resource.properties.get('service_name') or '').lower()
+                owner = (resource.properties.get("service_owner") or "").lower()
+                service_name = (resource.properties.get("service_name") or "").lower()
                 vpce_owner_map[resource_id] = (owner, service_name)
             elif resource.resource_type == ResourceType.LAMBDA_FUNCTION:
                 lambda_ids.add(resource_id)
@@ -142,16 +177,20 @@ class BaseTransformer(ABC):
                 ResourceType.RDS_CLUSTER,
                 ResourceType.ELASTICACHE_CLUSTER,
                 ResourceType.OPENSEARCH_DOMAIN,
-                ResourceType.REDSHIFT_CLUSTER
+                ResourceType.REDSHIFT_CLUSTER,
             ]:
                 # Get ENI IDs from resource properties
-                for eni_id in resource.properties.get('network_interface_ids', []) or []:
+                for eni_id in (
+                    resource.properties.get("network_interface_ids", []) or []
+                ):
                     service_eni_ids.add(eni_id)
 
                 # Also check for ENI relationships (MEMBER_OF pointing to this service)
                 for rel in self.view.filtered_relationships:
-                    if (rel.relationship_type == RelationshipType.MEMBER_OF and
-                        rel.target_id == resource_id):
+                    if (
+                        rel.relationship_type == RelationshipType.MEMBER_OF
+                        and rel.target_id == resource_id
+                    ):
                         eni = self.view.filtered_resources.get(rel.source_id)
                         if eni and eni.resource_type == ResourceType.NETWORK_INTERFACE:
                             service_eni_ids.add(eni.resource_id)
@@ -161,49 +200,70 @@ class BaseTransformer(ABC):
             if rel.relationship_type != RelationshipType.ATTACHED_TO:
                 continue
             eni_resource = self.view.filtered_resources.get(rel.source_id)
-            if not eni_resource or eni_resource.resource_type != ResourceType.NETWORK_INTERFACE:
+            if (
+                not eni_resource
+                or eni_resource.resource_type != ResourceType.NETWORK_INTERFACE
+            ):
                 continue
             if rel.target_id in lambda_ids:
-                logger.debug(f"Service ENI detected via Lambda relationship: {eni_resource.resource_id} -> {rel.target_id}")
+                logger.debug(
+                    f"Service ENI detected via Lambda relationship: {eni_resource.resource_id} -> {rel.target_id}"
+                )
                 service_eni_ids.add(eni_resource.resource_id)
                 continue
             vpce_info = vpce_owner_map.get(rel.target_id)
             if vpce_info:
                 owner, service_name = vpce_info
-                if owner in {'amazon', 'aws', 'amazon web services', 'amazon web services, inc.'} or service_name.startswith('com.amazonaws.'):
-                    logger.debug(f"Service ENI detected via VPCE relationship: {eni_resource.resource_id} -> {rel.target_id} (owner={owner}, service={service_name})")
+                if owner in {
+                    "amazon",
+                    "aws",
+                    "amazon web services",
+                    "amazon web services, inc.",
+                } or service_name.startswith("com.amazonaws."):
+                    logger.debug(
+                        f"Service ENI detected via VPCE relationship: {eni_resource.resource_id} -> {rel.target_id} (owner={owner}, service={service_name})"
+                    )
                     service_eni_ids.add(eni_resource.resource_id)
 
         # Include ENIs whose metadata tags identify managed services (RDS, Lambda, etc.)
         for resource_id, resource in self.view.filtered_resources.items():
             if resource.resource_type != ResourceType.NETWORK_INTERFACE:
                 continue
-            attachment = (resource.properties or {}).get('attachment') or {}
-            owner = str(attachment.get('InstanceOwnerId', '')).lower()
+            attachment = (resource.properties or {}).get("attachment") or {}
+            owner = str(attachment.get("InstanceOwnerId", "")).lower()
             tags = resource.metadata.tags or {}
 
-            if owner in {'amazon-rds'}:
-                logger.debug(f"Service ENI detected via owner: {resource_id} owner={owner}")
+            if owner in {"amazon-rds"}:
+                logger.debug(
+                    f"Service ENI detected via owner: {resource_id} owner={owner}"
+                )
                 service_eni_ids.add(resource_id)
                 continue
 
-            desc = (resource.properties or {}).get('description', '')
+            desc = (resource.properties or {}).get("description", "")
             desc_lower = str(desc).lower()
-            if any(keyword in desc_lower for keyword in [
-                'rdsnetworkinterface',
-                'rds-',
-                'aurora',
-                'elasticache',
-                'redis',
-                'memcached',
-                'redshift',
-                'opensearch',
-                'elasticsearch'
-            ]):
-                logger.debug(f"Service ENI detected via description: {resource_id} desc={desc}")
+            if any(
+                keyword in desc_lower
+                for keyword in [
+                    "rdsnetworkinterface",
+                    "rds-",
+                    "aurora",
+                    "elasticache",
+                    "redis",
+                    "memcached",
+                    "redshift",
+                    "opensearch",
+                    "elasticsearch",
+                ]
+            ):
+                logger.debug(
+                    f"Service ENI detected via description: {resource_id} desc={desc}"
+                )
                 service_eni_ids.add(resource_id)
             else:
-                logger.debug(f"Non-service ENI retained: {resource_id} owner={owner} desc={desc} tags={tags}")
+                logger.debug(
+                    f"Non-service ENI retained: {resource_id} owner={owner} desc={desc} tags={tags}"
+                )
 
         return service_eni_ids
 
@@ -219,9 +279,13 @@ class BaseTransformer(ABC):
                 continue
 
             # Skip ENIs that belong to aggregated services (following V1 pattern)
-            if (resource.resource_type == ResourceType.NETWORK_INTERFACE and
-                resource_id in service_eni_ids):
-                logger.debug(f"Skipping ENI {resource_id} - belongs to aggregated service")
+            if (
+                resource.resource_type == ResourceType.NETWORK_INTERFACE
+                and resource_id in service_eni_ids
+            ):
+                logger.debug(
+                    f"Skipping ENI {resource_id} - belongs to aggregated service"
+                )
                 continue
 
             # Create nodes for resources that should be displayed
@@ -245,9 +309,9 @@ class BaseTransformer(ABC):
                 "region": resource.location.region,
                 "availability_zone": resource.location.availability_zone,
                 "generic_type": generic_type,
-                **resource.properties
+                **resource.properties,
             },
-            resource_type=resource.resource_type
+            resource_type=resource.resource_type,
         )
 
         # No styling applied - let individual transformers handle format-specific styling
@@ -262,7 +326,10 @@ class BaseTransformer(ABC):
         across all output formats (AWS Labs, draw.io, etc.).
         """
         # Skip subnets when logical grouping is enabled (they become containers)
-        if resource.resource_type == ResourceType.SUBNET and self.logical_subnets_enabled:
+        if (
+            resource.resource_type == ResourceType.SUBNET
+            and self.logical_subnets_enabled
+        ):
             return True
 
         # Skip load balancers as standalone nodes (handled by logical subnet stacks)
@@ -275,12 +342,11 @@ class BaseTransformer(ABC):
 
         # Skip ECS services that have target groups (handled by LB/TG clustering)
         if resource.resource_type == ResourceType.ECS_SERVICE:
-            has_tgs = bool(resource.properties.get('target_group_arns'))
+            has_tgs = bool(resource.properties.get("target_group_arns"))
             if has_tgs:
                 return True
 
         return False
-
 
     def _create_containers(self) -> None:
         """Create hierarchical containers (VPCs, subnets, clusters)."""
@@ -310,16 +376,18 @@ class BaseTransformer(ABC):
                 container_type="vpc",
                 properties={
                     "resource_id": resource_id,
-                    "cidr_blocks": getattr(resource, 'cidr_blocks', [])
+                    "cidr_blocks": getattr(resource, "cidr_blocks", []),
                 },
-                layout_type=LayoutType.VERTICAL_STACK  # Changed to vertical stack
+                layout_type=LayoutType.VERTICAL_STACK,  # Changed to vertical stack
             )
 
             # Find logical subnet containers for this VPC
             logical_subnet_containers = []
             for container_id, logical_container in self.graph.containers.items():
-                if (logical_container.container_type == "logical_subnet" and
-                    logical_container.properties.get('vpc_id') == resource_id):
+                if (
+                    logical_container.container_type == "logical_subnet"
+                    and logical_container.properties.get("vpc_id") == resource_id
+                ):
                     logical_subnet_containers.append(container_id)
 
             # Add logical subnet containers to VPC
@@ -329,11 +397,13 @@ class BaseTransformer(ABC):
             # Add any VPC-level resources that aren't part of logical subnets
             # (like NAT gateways, internet gateways, etc.)
             for res_id, res in self.view.filtered_resources.items():
-                if (hasattr(res, 'properties') and
-                    res.properties.get('vpc_id') == resource_id and
-                    res_id != resource_id and
-                    res_id in self.graph.nodes and
-                    not self._is_resource_in_logical_subnet(res_id)):
+                if (
+                    hasattr(res, "properties")
+                    and res.properties.get("vpc_id") == resource_id
+                    and res_id != resource_id
+                    and res_id in self.graph.nodes
+                    and not self._is_resource_in_logical_subnet(res_id)
+                ):
                     container.add_child(res_id)
 
             self.graph.add_container(container)
@@ -349,7 +419,7 @@ class BaseTransformer(ABC):
             if resource.resource_type != ResourceType.SUBNET:
                 continue
 
-            vpc_id = resource.properties.get('vpc_id')
+            vpc_id = resource.properties.get("vpc_id")
             if not vpc_id:
                 continue
 
@@ -367,7 +437,9 @@ class BaseTransformer(ABC):
         tg_lambda_targets = self._collect_target_group_lambda_targets()
 
         # Build ECS service to cluster mapping for proper hierarchy placement
-        ecs_service_clusters = self._build_ecs_service_cluster_mapping(vpc_subnet_groups)
+        ecs_service_clusters = self._build_ecs_service_cluster_mapping(
+            vpc_subnet_groups
+        )
 
         # Create logical subnet containers with proper resource placement
         for vpc_id, groups in vpc_subnet_groups.items():
@@ -381,9 +453,9 @@ class BaseTransformer(ABC):
                     properties={
                         "vpc_id": vpc_id,
                         "group_name": group_name,
-                        "subnet_ids": subnet_ids
+                        "subnet_ids": subnet_ids,
                     },
-                    layout_type=LayoutType.VERTICAL_STACK
+                    layout_type=LayoutType.VERTICAL_STACK,
                 )
 
                 # Organize content in rows following V1 pattern
@@ -395,15 +467,23 @@ class BaseTransformer(ABC):
                 aux_resources = []  # Network resources (ENIs, NAT gateways, etc.)
 
                 # Add ECS cluster hierarchies
-                ecs_clusters = self._collect_ecs_clusters_for_logical_subnet(subnet_set, ecs_service_clusters)
+                ecs_clusters = self._collect_ecs_clusters_for_logical_subnet(
+                    subnet_set, ecs_service_clusters
+                )
                 service_nodes.extend(ecs_clusters)
 
                 # Add standalone services (Lambda, databases)
-                standalone_services = self._collect_standalone_services_for_logical_subnet(subnet_set, tg_lambda_targets)
+                standalone_services = (
+                    self._collect_standalone_services_for_logical_subnet(
+                        subnet_set, tg_lambda_targets
+                    )
+                )
                 service_nodes.extend(standalone_services)
 
                 # Add auxiliary network resources
-                network_resources = self._collect_network_resources_for_logical_subnet(subnet_set)
+                network_resources = self._collect_network_resources_for_logical_subnet(
+                    subnet_set
+                )
                 aux_resources.extend(network_resources)
 
                 # Create row-based organization
@@ -418,7 +498,9 @@ class BaseTransformer(ABC):
                     if len(service_nodes) > 1:
                         # Create grid for multiple services
                         grid_container_id = f"{container_id}-services-grid"
-                        grid_container = self._create_service_grid(grid_container_id, service_nodes)
+                        grid_container = self._create_service_grid(
+                            grid_container_id, service_nodes
+                        )
                         if grid_container:
                             rows.append(grid_container)
                     else:
@@ -434,46 +516,52 @@ class BaseTransformer(ABC):
                 # Only create container if it has content
                 if container.children_ids:
                     self.graph.add_container(container)
-                    logger.debug(f"Created logical subnet {container_id} with {len(rows)} rows")
+                    logger.debug(
+                        f"Created logical subnet {container_id} with {len(rows)} rows"
+                    )
 
     def _extract_subnet_logical_group(self, subnet_resource: BaseResource) -> str:
         """Extract logical group name from subnet using naming patterns and tags."""
         subnet_name = (subnet_resource.name or subnet_resource.resource_id).lower()
 
         # Check tags first for explicit type designation
-        tags = subnet_resource.properties.get('tags', {})
-        subnet_type = tags.get('Type', '').lower()
+        tags = subnet_resource.properties.get("tags", {})
+        subnet_type = tags.get("Type", "").lower()
         if subnet_type:
-            if 'public' in subnet_type:
-                return 'public-subnets'
-            elif 'private' in subnet_type:
-                return 'private-subnets'
+            if "public" in subnet_type:
+                return "public-subnets"
+            elif "private" in subnet_type:
+                return "private-subnets"
 
         # Extract from common naming patterns
-        if 'private' in subnet_name:
-            return 'private-subnets'
-        elif 'public' in subnet_name:
-            return 'public-subnets'
-        elif 'tgw' in subnet_name:
-            return 'tgw-subnets'
-        elif 'db' in subnet_name or 'database' in subnet_name:
-            return 'database-subnets'
-        elif 'web' in subnet_name:
-            return 'web-subnets'
-        elif 'app' in subnet_name:
-            return 'app-subnets'
+        if "private" in subnet_name:
+            return "private-subnets"
+        elif "public" in subnet_name:
+            return "public-subnets"
+        elif "tgw" in subnet_name:
+            return "tgw-subnets"
+        elif "db" in subnet_name or "database" in subnet_name:
+            return "database-subnets"
+        elif "web" in subnet_name:
+            return "web-subnets"
+        elif "app" in subnet_name:
+            return "app-subnets"
         else:
             # Extract prefix before AZ designation
-            parts = subnet_name.split('-')
+            parts = subnet_name.split("-")
             if len(parts) >= 2:
                 # Remove AZ suffix if present (like '2a', '2b', '2c')
                 import re
-                if re.match(r'^[0-9][a-z]$', parts[-1]):
-                    return '-'.join(parts[:-1]) + '-subnets'
-                else:
-                    return '-'.join(parts[:-1]) + '-subnets' if len(parts) > 1 else subnet_name
-            return 'misc-subnets'
 
+                if re.match(r"^[0-9][a-z]$", parts[-1]):
+                    return "-".join(parts[:-1]) + "-subnets"
+                else:
+                    return (
+                        "-".join(parts[:-1]) + "-subnets"
+                        if len(parts) > 1
+                        else subnet_name
+                    )
+            return "misc-subnets"
 
     def _collect_target_group_lambda_targets(self) -> Set[str]:
         """Collect Lambda function IDs that are targets of target groups to prevent multi-parenting."""
@@ -481,16 +569,18 @@ class BaseTransformer(ABC):
 
         for resource_id, resource in self.view.filtered_resources.items():
             if resource.resource_type == ResourceType.TARGET_GROUP:
-                target_type = resource.properties.get('target_type')
-                if target_type == 'lambda':
-                    targets = resource.properties.get('targets', [])
+                target_type = resource.properties.get("target_type")
+                if target_type == "lambda":
+                    targets = resource.properties.get("targets", [])
                     for target in targets:
-                        if target.get('id'):
-                            tg_lambda_targets.add(str(target['id']))
+                        if target.get("id"):
+                            tg_lambda_targets.add(str(target["id"]))
 
         return tg_lambda_targets
 
-    def _build_ecs_service_cluster_mapping(self, vpc_subnet_groups: Dict) -> Dict[str, Dict]:
+    def _build_ecs_service_cluster_mapping(
+        self, vpc_subnet_groups: Dict
+    ) -> Dict[str, Dict]:
         """Build mapping of ECS services to their clusters across all VPCs."""
         ecs_service_clusters = {}
 
@@ -504,17 +594,22 @@ class BaseTransformer(ABC):
         # Map each ECS service to its cluster information
         for service_id, service_resource in self.view.filtered_resources.items():
             if service_resource.resource_type == ResourceType.ECS_SERVICE:
-                service_subnets = set(service_resource.properties.get('subnet_ids', []))
+                service_subnets = set(service_resource.properties.get("subnet_ids", []))
 
                 # Only process services in the VPCs we're working with
                 if service_subnets & vpc_subnet_set:
-                    cluster_arn = service_resource.properties.get('clusterArn')
+                    cluster_arn = service_resource.properties.get("clusterArn")
                     if cluster_arn:
                         # Find the cluster resource
                         cluster_resource = None
-                        for cluster_id, cluster_res in self.view.filtered_resources.items():
-                            if (cluster_res.resource_type == ResourceType.ECS_CLUSTER and
-                                cluster_res.resource_id == cluster_arn):
+                        for (
+                            cluster_id,
+                            cluster_res,
+                        ) in self.view.filtered_resources.items():
+                            if (
+                                cluster_res.resource_type == ResourceType.ECS_CLUSTER
+                                and cluster_res.resource_id == cluster_arn
+                            ):
                                 cluster_resource = cluster_res
                                 break
 
@@ -530,23 +625,24 @@ class BaseTransformer(ABC):
                                     break
 
                             ecs_service_clusters[service_id] = {
-                                'cluster_resource': cluster_resource,
-                                'cluster_arn': cluster_arn,
-                                'service_group': service_group,
-                                'service_subnets': service_subnets
+                                "cluster_resource": cluster_resource,
+                                "cluster_arn": cluster_arn,
+                                "service_group": service_group,
+                                "service_subnets": service_subnets,
                             }
 
         return ecs_service_clusters
 
-    def _collect_ecs_clusters_for_logical_subnet(self, subnet_set: Set[str],
-                                               ecs_service_clusters: Dict[str, Dict]) -> List[str]:
+    def _collect_ecs_clusters_for_logical_subnet(
+        self, subnet_set: Set[str], ecs_service_clusters: Dict[str, Dict]
+    ) -> List[str]:
         """Collect ECS cluster container IDs for this logical subnet."""
         cluster_services = {}  # cluster_arn -> [service_ids]
 
         for service_id, cluster_info in ecs_service_clusters.items():
-            service_subnets = cluster_info['service_subnets']
+            service_subnets = cluster_info["service_subnets"]
             if service_subnets & subnet_set:  # Service is in this subnet group
-                cluster_arn = cluster_info['cluster_arn']
+                cluster_arn = cluster_info["cluster_arn"]
                 if cluster_arn not in cluster_services:
                     cluster_services[cluster_arn] = []
                 cluster_services[cluster_arn].append(service_id)
@@ -557,14 +653,18 @@ class BaseTransformer(ABC):
         for cluster_arn, service_ids in cluster_services.items():
             if service_ids:  # Only create if there are services
                 cluster_info = ecs_service_clusters[service_ids[0]]
-                cluster_resource = cluster_info['cluster_resource']
+                cluster_resource = cluster_info["cluster_resource"]
 
                 # Use V1-style cluster ID pattern for consistency
-                cluster_name = cluster_resource.name or cluster_resource.resource_id.split('/')[-1]
+                cluster_name = (
+                    cluster_resource.name or cluster_resource.resource_id.split("/")[-1]
+                )
                 cluster_container_id = f"cluster-{cluster_name}-logical-subnet"
 
                 # Group services by security groups for de-duplication
-                services_by_sg = self._group_ecs_services_by_security_groups(service_ids)
+                services_by_sg = self._group_ecs_services_by_security_groups(
+                    service_ids
+                )
 
                 cluster_container = GraphContainer(
                     id=cluster_container_id,
@@ -572,14 +672,14 @@ class BaseTransformer(ABC):
                     container_type="ecs_cluster",
                     properties={
                         "cluster_arn": cluster_arn,
-                        "service_count": len(service_ids)
+                        "service_count": len(service_ids),
                     },
-                    layout_type=LayoutType.VERTICAL_STACK
+                    layout_type=LayoutType.VERTICAL_STACK,
                 )
 
                 # Add services or security group containers as children
                 for sg_key, grouped_service_ids in services_by_sg.items():
-                    if sg_key == ('no-sg',):
+                    if sg_key == ("no-sg",):
                         # Services without security groups - add directly
                         for service_id in grouped_service_ids:
                             cluster_container.add_child(service_id)
@@ -595,15 +695,17 @@ class BaseTransformer(ABC):
 
         return cluster_container_ids
 
-    def _group_ecs_services_by_security_groups(self, service_ids: List[str]) -> Dict[Tuple[str, ...], List[str]]:
+    def _group_ecs_services_by_security_groups(
+        self, service_ids: List[str]
+    ) -> Dict[Tuple[str, ...], List[str]]:
         """Group ECS services by their security group combinations for de-duplication."""
         services_by_sg = {}
 
         for service_id in service_ids:
             service_resource = self.view.filtered_resources.get(service_id)
             if service_resource:
-                sgs = service_resource.properties.get('security_group_ids', [])
-                sg_key = tuple(sorted(sgs)) if sgs else ('no-sg',)
+                sgs = service_resource.properties.get("security_group_ids", [])
+                sg_key = tuple(sorted(sgs)) if sgs else ("no-sg",)
 
                 if sg_key not in services_by_sg:
                     services_by_sg[sg_key] = []
@@ -611,8 +713,9 @@ class BaseTransformer(ABC):
 
         return services_by_sg
 
-    def _create_security_group_container(self, sg_key: Tuple[str, ...], service_ids: List[str],
-                                       parent_id: str) -> str:
+    def _create_security_group_container(
+        self, sg_key: Tuple[str, ...], service_ids: List[str], parent_id: str
+    ) -> str:
         """Create nested security group containers for shared security groups."""
         container_id = f"sg-shared-{'-'.join(sg_key[:2])}-in-{parent_id}"
 
@@ -625,7 +728,7 @@ class BaseTransformer(ABC):
                 id=stack_id,
                 label="Services",
                 container_type="service_stack",
-                layout_type=LayoutType.HORIZONTAL_STACK
+                layout_type=LayoutType.HORIZONTAL_STACK,
             )
             for service_id in service_ids:
                 services_stack.add_child(service_id)
@@ -635,7 +738,7 @@ class BaseTransformer(ABC):
         # Create nested security group containers (innermost to outermost)
         current_container = inner_content
         for sg_id in reversed(list(sg_key)):
-            if sg_id == 'no-sg':
+            if sg_id == "no-sg":
                 continue
 
             sg_container_id = f"sg-{sg_id}-in-{parent_id}"
@@ -646,7 +749,7 @@ class BaseTransformer(ABC):
                 id=sg_container_id,
                 label=f"SG: {sg_name}",
                 container_type="security_group",
-                layout_type=LayoutType.FREE_FORM
+                layout_type=LayoutType.FREE_FORM,
             )
             sg_container.add_child(current_container)
             self.graph.add_container(sg_container)
@@ -654,14 +757,15 @@ class BaseTransformer(ABC):
 
         return current_container
 
-    def _collect_standalone_services_for_logical_subnet(self, subnet_set: Set[str],
-                                                      tg_lambda_targets: Set[str]) -> List[str]:
+    def _collect_standalone_services_for_logical_subnet(
+        self, subnet_set: Set[str], tg_lambda_targets: Set[str]
+    ) -> List[str]:
         """Collect standalone services (Lambda, databases) for this logical subnet."""
         service_ids = []
 
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self.graph.nodes:  # Ensure node exists
-                resource_subnets = set(resource.properties.get('subnet_ids', []))
+                resource_subnets = set(resource.properties.get("subnet_ids", []))
 
                 # Check if resource belongs to this subnet group
                 if resource_subnets & subnet_set:
@@ -676,14 +780,16 @@ class BaseTransformer(ABC):
                         ResourceType.RDS_CLUSTER,
                         ResourceType.ELASTICACHE_CLUSTER,
                         ResourceType.OPENSEARCH_DOMAIN,
-                        ResourceType.REDSHIFT_CLUSTER
+                        ResourceType.REDSHIFT_CLUSTER,
                     ]:
                         # Database and analytics services
                         service_ids.append(resource_id)
 
         return service_ids
 
-    def _collect_network_resources_for_logical_subnet(self, subnet_set: Set[str]) -> List[str]:
+    def _collect_network_resources_for_logical_subnet(
+        self, subnet_set: Set[str]
+    ) -> List[str]:
         """Collect network interfaces and other network resources for this logical subnet."""
         network_resource_ids = []
 
@@ -693,7 +799,7 @@ class BaseTransformer(ABC):
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self.graph.nodes:  # Ensure node exists
                 if resource.resource_type == ResourceType.NETWORK_INTERFACE:
-                    subnet_id = resource.properties.get('subnet_id')
+                    subnet_id = resource.properties.get("subnet_id")
                     if subnet_id in subnet_set:
                         # Only include ENIs that are not already associated with services
                         # Check if this ENI is a member of any service or belongs to aggregated services
@@ -705,12 +811,22 @@ class BaseTransformer(ABC):
                         else:
                             # Check if ENI is a member of other services
                             for rel in self.view.filtered_relationships:
-                                if (rel.source_id == resource_id and
-                                    rel.relationship_type == RelationshipType.MEMBER_OF):
-                                    target_resource = self.view.filtered_resources.get(rel.target_id)
-                                    if target_resource and target_resource.resource_type in [
-                                        ResourceType.ECS_SERVICE, ResourceType.LAMBDA_FUNCTION
-                                    ]:
+                                if (
+                                    rel.source_id == resource_id
+                                    and rel.relationship_type
+                                    == RelationshipType.MEMBER_OF
+                                ):
+                                    target_resource = self.view.filtered_resources.get(
+                                        rel.target_id
+                                    )
+                                    if (
+                                        target_resource
+                                        and target_resource.resource_type
+                                        in [
+                                            ResourceType.ECS_SERVICE,
+                                            ResourceType.LAMBDA_FUNCTION,
+                                        ]
+                                    ):
                                         is_service_eni = True
                                         break
 
@@ -733,17 +849,21 @@ class BaseTransformer(ABC):
 
         return False
 
-    def _resource_belongs_to_logical_subnet(self, resource: BaseResource, logical_container: GraphContainer) -> bool:
+    def _resource_belongs_to_logical_subnet(
+        self, resource: BaseResource, logical_container: GraphContainer
+    ) -> bool:
         """Check if a resource belongs to a specific logical subnet container."""
-        subnet_ids = logical_container.properties.get('subnet_ids', [])
+        subnet_ids = logical_container.properties.get("subnet_ids", [])
         if not subnet_ids:
             return False
 
         # Check if resource is in any of the logical subnet's physical subnets
-        resource_subnets = set(resource.properties.get('subnet_ids', []))
+        resource_subnets = set(resource.properties.get("subnet_ids", []))
         return bool(resource_subnets & set(subnet_ids))
 
-    def _create_service_grid(self, grid_container_id: str, service_ids: List[str]) -> str:
+    def _create_service_grid(
+        self, grid_container_id: str, service_ids: List[str]
+    ) -> str:
         """Create a grid layout for services following V1 pattern."""
         if not service_ids:
             return None
@@ -762,7 +882,7 @@ class BaseTransformer(ABC):
             id=grid_container_id,
             label="Services",
             container_type="service_grid",
-            layout_type=LayoutType.VERTICAL_STACK
+            layout_type=LayoutType.VERTICAL_STACK,
         )
 
         for i in range(rows):
@@ -783,7 +903,7 @@ class BaseTransformer(ABC):
                     id=row_id,
                     label=f"Service Row {i+1}",
                     container_type="service_row",
-                    layout_type=LayoutType.HORIZONTAL_STACK
+                    layout_type=LayoutType.HORIZONTAL_STACK,
                 )
 
                 for service_id in row_services:
@@ -808,9 +928,9 @@ class BaseTransformer(ABC):
                 properties={
                     "resource_id": resource_id,
                     "availability_zone": resource.location.availability_zone,
-                    "cidr_blocks": getattr(resource, 'cidr_blocks', [])
+                    "cidr_blocks": getattr(resource, "cidr_blocks", []),
                 },
-                layout_type=LayoutType.FREE_FORM
+                layout_type=LayoutType.FREE_FORM,
             )
 
             self.graph.add_container(container)
@@ -822,8 +942,10 @@ class BaseTransformer(ABC):
         # Find all ECS clusters that exist as nodes
         clusters = {}
         for rid, res in self.view.filtered_resources.items():
-            if (res.resource_type == ResourceType.ECS_CLUSTER and
-                rid in self.graph.nodes):  # Ensure cluster node exists
+            if (
+                res.resource_type == ResourceType.ECS_CLUSTER
+                and rid in self.graph.nodes
+            ):  # Ensure cluster node exists
                 clusters[rid] = res
 
         for cluster_id, cluster_resource in clusters.items():
@@ -832,13 +954,17 @@ class BaseTransformer(ABC):
             services = []
 
             for svc_id, svc_res in self.view.filtered_resources.items():
-                if (svc_res.resource_type == ResourceType.ECS_SERVICE and
-                    svc_res.properties.get('clusterArn') == cluster_arn):
+                if (
+                    svc_res.resource_type == ResourceType.ECS_SERVICE
+                    and svc_res.properties.get("clusterArn") == cluster_arn
+                ):
                     # Only include services that exist in graph
                     if svc_id in self.graph.nodes:
                         services.append(svc_id)
 
-            if services:  # Only create container if there are services that will be rendered
+            if (
+                services
+            ):  # Only create container if there are services that will be rendered
                 container = GraphContainer(
                     id=f"ecs-cluster-container-{cluster_id}",
                     label=cluster_resource.name or cluster_id,
@@ -846,9 +972,9 @@ class BaseTransformer(ABC):
                     properties={
                         "resource_id": cluster_id,
                         "cluster_arn": cluster_arn,
-                        "service_count": len(services)
+                        "service_count": len(services),
                     },
-                    layout_type=LayoutType.VERTICAL_STACK
+                    layout_type=LayoutType.VERTICAL_STACK,
                 )
 
                 for service_id in services:
@@ -857,9 +983,13 @@ class BaseTransformer(ABC):
                     self._group_parent[service_id] = container.id
 
                 self.graph.add_container(container)
-                logger.debug(f"Created ECS cluster container {container.id} with {len(services)} services")
+                logger.debug(
+                    f"Created ECS cluster container {container.id} with {len(services)} services"
+                )
             else:
-                logger.debug(f"Skipping ECS cluster {cluster_id} - no valid services to render")
+                logger.debug(
+                    f"Skipping ECS cluster {cluster_id} - no valid services to render"
+                )
 
     def _create_edges(self) -> None:
         """Create edges from topology relationships."""
@@ -870,11 +1000,17 @@ class BaseTransformer(ABC):
             if edge:
                 self.graph.add_edge(edge)
 
-    def _create_edge_from_relationship(self, relationship: Relationship) -> Optional[GraphEdge]:
+        self._add_inferred_eni_edges()
+
+    def _create_edge_from_relationship(
+        self, relationship: Relationship
+    ) -> Optional[GraphEdge]:
         """Create a graph edge from a topology relationship."""
         # Skip if either source or target is not in the graph
-        if (relationship.source_id not in self.graph.nodes or
-            relationship.target_id not in self.graph.nodes):
+        if (
+            relationship.source_id not in self.graph.nodes
+            or relationship.target_id not in self.graph.nodes
+        ):
             return None
 
         edge_id = f"{relationship.source_id}-{relationship.target_id}-{relationship.relationship_type.value}"
@@ -883,15 +1019,50 @@ class BaseTransformer(ABC):
             id=edge_id,
             source_id=relationship.source_id,
             target_id=relationship.target_id,
-            label=relationship.relationship_type.value.replace('_', ' ').title(),
+            label=relationship.relationship_type.value.replace("_", " ").title(),
             properties=relationship.properties,
-            relationship_type=relationship.relationship_type.value
+            relationship_type=relationship.relationship_type.value,
         )
 
         # No styling applied - let individual transformers handle format-specific styling
 
         return edge
 
+    def _add_inferred_eni_edges(self) -> None:
+        """Add inferred ENI -> resource edges when explicit relationships are absent."""
+
+        resources = self.view.filtered_resources
+
+        for eni_id, eni_resource in resources.items():
+            if eni_resource.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+
+            description = (eni_resource.properties or {}).get("description")
+            identifier = extract_elb_identifier(description)
+            if not identifier:
+                continue
+
+            target_id = resolve_load_balancer_identifier(identifier, resources)
+            if not target_id:
+                continue
+
+            if eni_id not in self.graph.nodes or target_id not in self.graph.nodes:
+                continue
+
+            edge_id = f"{eni_id}-{target_id}-attached_inferred"
+            if edge_id in self.graph.edges:
+                continue
+
+            self.graph.add_edge(
+                GraphEdge(
+                    id=edge_id,
+                    source_id=eni_id,
+                    target_id=target_id,
+                    label=RelationshipType.ATTACHED_TO.value.replace("_", " ").title(),
+                    relationship_type=RelationshipType.ATTACHED_TO.value,
+                    properties={"inferred": True},
+                )
+            )
 
     def _optimize_layout(self) -> None:
         """Apply layout optimizations to the graph."""
@@ -910,12 +1081,7 @@ class BaseTransformer(ABC):
 
         for node in self.graph.nodes.values():
             if not node.position:
-                node.position = Position(
-                    x=current_x,
-                    y=current_y,
-                    width=100,
-                    height=80
-                )
+                node.position = Position(x=current_x, y=current_y, width=100, height=80)
 
                 node_count += 1
                 if node_count % nodes_per_row == 0:
