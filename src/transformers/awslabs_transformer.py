@@ -113,6 +113,8 @@ class AWSLabsTransformer:
         self._eni_instance_map: Dict[str, str] = {}
         self._vpce_eni_owner_cache: Dict[str, Tuple[BaseResource, str]] = {}
         self._vpce_eni_cache_populated = False
+        self._cluster_parent: Dict[str, str] = {}
+        self._cluster_badges: Dict[Tuple[str, str, str], str] = {}
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
@@ -718,6 +720,7 @@ class AWSLabsTransformer:
                     "Title": cluster_resource.name or cluster_resource.resource_id.split('/')[-1],
                     "Children": []
                 }
+                self._cluster_parent[cluster_node_id] = group_node_id
 
                 # Process each SG group within the cluster
                 for sg_key, services in cluster_info['services_by_sg'].items():
@@ -908,10 +911,17 @@ class AWSLabsTransformer:
                             tgs = set(svc.properties.get('target_group_arns') or [])
                             if tg_id in tgs:
                                 cluster_arn = svc.properties.get('clusterArn')
-                                if cluster_arn in cluster_hierarchies:
+                                cluster_node_id = None
+                                if cluster_arn and cluster_arn in cluster_hierarchies:
                                     cluster_node_id = cluster_hierarchies[cluster_arn]['node_id']
+                                elif global_ecs_service_tracking.get(svc_id):
+                                    cluster_node_id = global_ecs_service_tracking[svc_id]['cluster_node_id']
+
+                                if cluster_node_id:
                                     ecs_clusters_for_tg.add(cluster_node_id)
-                                    logger.debug(f"Found ECS cluster {cluster_node_id} for TG {tg_id}")
+                                    logger.debug(
+                                        f"Found ECS cluster {cluster_node_id} for TG {tg_id}"
+                                    )
 
                     # Process direct targets (Lambda, EC2, IPs)
                     for target in tg.properties.get('targets') or []:
@@ -944,9 +954,20 @@ class AWSLabsTransformer:
 
                     # ECS Clusters Section
                     if ecs_clusters_for_tg:
-                        for cluster_node_id in ecs_clusters_for_tg:
-                            target_sections.append(cluster_node_id)
-                            logger.debug(f"Added ECS cluster {cluster_node_id} to LB {lb_id}")
+                        for cluster_node_id in sorted(ecs_clusters_for_tg):
+                            if self._cluster_parent.get(cluster_node_id) == group_node_id:
+                                target_sections.append(cluster_node_id)
+                                logger.debug(
+                                    f"Added ECS cluster {cluster_node_id} to LB {lb_id}"
+                                )
+                            else:
+                                badge_id = self._ensure_cluster_badge(
+                                    resources, cluster_node_id, lb_id, tg_id
+                                )
+                                target_sections.append(badge_id)
+                                logger.debug(
+                                    f"Added cluster badge {badge_id} for {cluster_node_id}"
+                                )
                     # Lambda Section (grouped by shared SGs)
                     if lambda_targets:
                         lambda_section_id = f"lambda-section-{tg_id}-in-{group_key}"
@@ -1130,10 +1151,22 @@ class AWSLabsTransformer:
                             else:
                                 logger.debug(f"IP {ip} does not map to any known service - will render IP")
 
-                            ip_node_id = f"ip-{ip}{('-'+str(port)) if port else ''}-in-{group_key}"
+                            ip_node_id = (
+                                f"lb-ip-target-{self._sanitize_identifier(lb_id)}-"
+                                f"{self._sanitize_identifier(tg_id)}-"
+                                f"{self._sanitize_identifier(ip)}-{str(port) if port else 'noport'}"
+                            )
                             if ip_node_id not in resources:
-                                title = f"IP {ip}{(':'+str(port)) if port else ''}"
-                                resources[ip_node_id] = {"Type": "AWS::EC2::Instance", "Title": title}
+                                title_lines = [f"IP {ip}{(':'+str(port)) if port else ''}"]
+                                tg_label = tg.name or (tg.resource_id if tg else tg_id)
+                                if tg_label:
+                                    tg_display = tg_label.split('/')[-1] if '/' in tg_label else tg_label
+                                    title_lines.append(f"TG: {tg_display}")
+                                title_lines.append(f"LB: {lb_title}")
+                                resources[ip_node_id] = {
+                                    "Type": "AWS::EC2::Instance",
+                                    "Title": "\n".join(title_lines),
+                                }
                             ip_nodes.append(ip_node_id)
 
                         if ip_nodes:
@@ -1800,6 +1833,44 @@ class AWSLabsTransformer:
 
         # Fallback for other formats
         return str(tid), port
+
+    def _sanitize_identifier(self, value: str) -> str:
+        """Create a diagram-safe identifier fragment."""
+        return (
+            str(value)
+            .replace(':', '-')
+            .replace('/', '-')
+            .replace('=', '-')
+            .replace(',', '-')
+            .replace(' ', '-')
+        )
+
+    def _ensure_cluster_badge(
+        self,
+        resources: Dict[str, Any],
+        cluster_node_id: str,
+        lb_id: str,
+        tg_id: str,
+    ) -> str:
+        key = (cluster_node_id, lb_id, tg_id)
+        cached = self._cluster_badges.get(key)
+        if cached:
+            return cached
+
+        cluster_title = resources.get(cluster_node_id, {}).get("Title", cluster_node_id)
+        badge_id = (
+            f"lb-cluster-badge-{self._sanitize_identifier(cluster_node_id)}-"
+            f"{self._sanitize_identifier(lb_id)}-{self._sanitize_identifier(tg_id)}"
+        )
+
+        if badge_id not in resources:
+            resources[badge_id] = {
+                "Type": "AWS::Generic::Resource",
+                "Title": f"Cluster: {cluster_title}",
+            }
+
+        self._cluster_badges[key] = badge_id
+        return badge_id
 
     def _extract_security_group_ids(self, properties: Dict[str, Any]) -> List[str]:
         """Normalize security group identifiers from resource properties."""
