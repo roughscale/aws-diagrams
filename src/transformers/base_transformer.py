@@ -114,6 +114,9 @@ class BaseTransformer(ABC):
         self.logical_subnets_enabled: bool = True
         self._group_parent: Dict[str, str] = {}  # resource_id -> logical subnet node id
         self._processed_resources: Set[str] = set()
+        self.include_load_balancer_nodes: bool = False
+        self.include_target_group_nodes: bool = False
+        self.include_tg_backed_services: bool = False
 
         logger.info(f"Initialized {self.__class__.__name__} for view '{view.name}'")
 
@@ -312,6 +315,7 @@ class BaseTransformer(ABC):
                 **resource.properties,
             },
             resource_type=resource.resource_type,
+            resource=resource,
         )
 
         # No styling applied - let individual transformers handle format-specific styling
@@ -332,18 +336,24 @@ class BaseTransformer(ABC):
         ):
             return True
 
-        # Skip load balancers as standalone nodes (handled by logical subnet stacks)
-        if resource.resource_type == ResourceType.LOAD_BALANCER:
+        # Skip load balancers unless explicitly included
+        if (
+            resource.resource_type == ResourceType.LOAD_BALANCER
+            and not self.include_load_balancer_nodes
+        ):
             return True
 
         # Skip target groups as standalone nodes (not user-visible components)
-        if resource.resource_type == ResourceType.TARGET_GROUP:
+        if (
+            resource.resource_type == ResourceType.TARGET_GROUP
+            and not self.include_target_group_nodes
+        ):
             return True
 
         # Skip ECS services that have target groups (handled by LB/TG clustering)
         if resource.resource_type == ResourceType.ECS_SERVICE:
             has_tgs = bool(resource.properties.get("target_group_arns"))
-            if has_tgs:
+            if has_tgs and not self.include_tg_backed_services:
                 return True
 
         return False
@@ -858,7 +868,18 @@ class BaseTransformer(ABC):
             return False
 
         # Check if resource is in any of the logical subnet's physical subnets
-        resource_subnets = set(resource.properties.get("subnet_ids", []))
+        resource_subnets: Set[str] = set()
+
+        subnet_list = resource.properties.get("subnet_ids", [])
+        if isinstance(subnet_list, str):
+            resource_subnets.add(subnet_list)
+        else:
+            resource_subnets.update(subnet_list or [])
+
+        single_subnet = resource.properties.get("subnet_id")
+        if single_subnet:
+            resource_subnets.add(single_subnet)
+
         return bool(resource_subnets & set(subnet_ids))
 
     def _create_service_grid(

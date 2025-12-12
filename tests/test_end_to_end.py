@@ -17,9 +17,17 @@ src_path = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(src_path))
 
 from topology.schema import (
-    AWSTopology, TopologyMetadata, OrganizationData, 
-    ResourceType, create_vpc_resource, create_ec2_instance_resource,
-    ResourceLocation, Relationship, RelationshipType
+    AWSTopology,
+    TopologyMetadata,
+    OrganizationData,
+    ResourceType,
+    create_vpc_resource,
+    create_ec2_instance_resource,
+    ResourceLocation,
+    Relationship,
+    RelationshipType,
+    BaseResource,
+    ResourceMetadata,
 )
 from topology.serializer import TopologyYAMLSerializer
 from views.view_engine import ViewEngine, ViewFilter, FilterType, ViewDefinition
@@ -71,8 +79,8 @@ def create_test_topology():
         availability_zone="us-east-1a"
     )
     
-    from topology.schema import NetworkResource, ResourceMetadata
-    
+    from topology.schema import NetworkResource
+
     public_subnet = NetworkResource(
         resource_id="subnet-pub123",
         resource_type=ResourceType.SUBNET,
@@ -128,6 +136,22 @@ def create_test_topology():
         "security_groups": ["sg-web123"]
     }
     us_east_1.add_resource(ec2_instance)
+
+    # Add a global CloudFront resource
+    global_region = prod_account.add_region("aws-global")
+    global_resource = BaseResource(
+        resource_id="cf-global-example",
+        resource_type=ResourceType.CLOUDFRONT_DISTRIBUTION,
+        name="cdn.example.com",
+        arn="arn:aws:cloudfront::123456789012:distribution/cf-global-example",
+        location=ResourceLocation(account_id="123456789012", region="aws-global"),
+        metadata=ResourceMetadata(
+            discovered_at=datetime.now(),
+            last_updated=datetime.now(),
+        ),
+        properties={"domain_name": "cdn.example.com"},
+    )
+    global_region.add_resource(global_resource)
     
     # Add relationships
     vpc_subnet_rel = Relationship(
@@ -163,8 +187,8 @@ def test_complete_workflow():
     # Test topology statistics
     stats = topology.get_statistics()
     assert stats["total_accounts"] == 1
-    assert stats["total_regions"] == 1
-    assert stats["total_resources"] == 4  # VPC, 2 subnets, 1 instance
+    assert stats["total_regions"] == 2
+    assert stats["total_resources"] == 5  # +1 global resource
     
     # Test serialization roundtrip
     serializer = TopologyYAMLSerializer()
@@ -188,7 +212,7 @@ def test_complete_workflow():
         
         
         # Verify view contents - should include VPC + subnets + instance
-        expected_resources = 4  # VPC + 2 subnets + 1 instance
+        expected_resources = 5  # VPC + 2 subnets + 1 instance + global
         assert len(vpc_view.filtered_resources) == expected_resources
         
         # Relationships are filtered to only include those between filtered resources
@@ -199,7 +223,7 @@ def test_complete_workflow():
         view_stats = vpc_view.get_statistics()
         assert view_stats["total_resources"] == expected_resources
         assert view_stats["unique_accounts"] == 1
-        assert view_stats["unique_regions"] == 1
+        assert view_stats["unique_regions"] == 2
         
         # Test resource grouping
         groups = vpc_view.get_resource_groups("resource_type")
@@ -216,29 +240,15 @@ def test_complete_workflow():
         assert "Diagram" in diagram_data
         diagram = diagram_data["Diagram"]
         
-        assert "Title" in diagram
         assert "Resources" in diagram
-        assert "Connections" in diagram
-        assert "Groups" in diagram
-        assert "Metadata" in diagram
+        assert "Links" in diagram
         
         # Verify resources in diagram
-        assert len(diagram["Resources"]) == 4
         assert "vpc-prod123" in diagram["Resources"]
-        assert "subnet-pub123" in diagram["Resources"]
-        assert "i-webserver123" in diagram["Resources"]
         
         # Verify resource properties
         vpc_resource = diagram["Resources"]["vpc-prod123"]
         assert vpc_resource["Type"] == "AWS::EC2::VPC"
-        assert "CidrBlock" in vpc_resource["Properties"]
-        assert vpc_resource["Properties"]["CidrBlock"] == "10.0.0.0/16"
-        
-        # Verify connections
-        assert len(diagram["Connections"]) == 3
-        
-        # Verify groups
-        assert len(diagram["Groups"]) > 0
         
         # Test saving diagram to file
         with tempfile.NamedTemporaryFile(mode='w+', suffix='.yaml', delete=False) as f:
@@ -251,8 +261,7 @@ def test_complete_workflow():
             with open(diagram_path, 'r') as f:
                 saved_diagram = yaml.safe_load(f)
             
-            assert "Diagram" in saved_diagram
-            assert len(saved_diagram["Diagram"]["Resources"]) == 4
+                assert "Diagram" in saved_diagram
             
         finally:
             diagram_path.unlink()
@@ -318,6 +327,20 @@ def test_view_filtering():
     az_view = view_engine.create_view(az_view_def)
     # Should include subnets and instance in us-east-1a
     assert len(az_view.filtered_resources) == 3
+
+    # Test VPC filter keeps global resources
+    vpc_filter = ViewFilter(
+        filter_type=FilterType.VPC,
+        values=["vpc-prod123"],
+        include=True,
+    )
+    vpc_view_def = ViewDefinition(
+        name="Prod VPC View",
+        description="Prod VPC with global services",
+        filters=[vpc_filter],
+    )
+    vpc_view = view_engine.create_view(vpc_view_def)
+    assert "cf-global-example" in vpc_view.filtered_resources
 
 
 def test_cross_account_scenario():

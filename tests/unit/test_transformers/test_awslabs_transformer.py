@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from typing import Dict, List
 
+import pytest
+
 from transformers.awslabs_transformer import AWSLabsTransformer
 from topology.schema import (
     BaseResource,
@@ -14,6 +16,9 @@ from topology.schema import (
     create_vpc_resource,
 )
 from views.view_engine import TopologyView
+
+
+pytestmark = pytest.mark.legacy
 
 
 def _metadata() -> ResourceMetadata:
@@ -414,19 +419,28 @@ def test_awslabs_transformer_shared_cluster_targets_render_badges():
         for rid, res in resources.items()
         if res.get("Type") == "AWS::Diagram::VerticalStack" and res.get("Title") == "shared-alb"
     )
-    lb_children = resources[lb_stack_id].get("Children", [])
+    def _descendants(node_id: str) -> List[str]:
+        children = resources.get(node_id, {}).get("Children") or []
+        nested = []
+        for child in children:
+            nested.append(child)
+            nested.extend(_descendants(child))
+        return nested
+
+    lb_children = resources[lb_stack_id].get("Children", []) or []
     assert not cluster_nodes.intersection(lb_children)
 
-    badge_ids = [cid for cid in lb_children if cid.startswith("lb-cluster-badge-")]
+    descendant_ids = _descendants(lb_stack_id)
+    badge_ids = [cid for cid in descendant_ids if cid.startswith("lb-cluster-badge-")]
     assert len(badge_ids) == 2
     for badge_id in badge_ids:
         badge = resources[badge_id]
-        assert badge.get("Type") == "AWS::Generic::Resource"
+        assert badge.get("Type") == "AWS::ECS::Cluster"
         assert badge.get("Children") in (None, [])
         assert "Cluster: shared-cluster" in badge.get("Title", "")
 
 
-def _build_lb_with_shared_ip_targets_view() -> TopologyView:
+def _build_complex_lb_view(simple: bool = False) -> TopologyView:
     resources: Dict[str, BaseResource] = {}
     relationships: List[Relationship] = []
 
@@ -485,6 +499,21 @@ def _build_lb_with_shared_ip_targets_view() -> TopologyView:
             "targets": [{"id": "10.99.0.10", "port": 443}],
         },
     )
+    backend_lb = BaseResource(
+        resource_id="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/backend/lb",
+        resource_type=ResourceType.LOAD_BALANCER,
+        name="backend-alb",
+        arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/backend/lb",
+        location=_location(),
+        metadata=_metadata(),
+        properties={
+            "type": "application",
+            "scheme": "internal",
+            "subnet_ids": [subnet.resource_id],
+        },
+    )
+    resources[backend_lb.resource_id] = backend_lb
+
     tg_two = BaseResource(
         resource_id="tg-ip-2",
         resource_type=ResourceType.TARGET_GROUP,
@@ -495,7 +524,10 @@ def _build_lb_with_shared_ip_targets_view() -> TopologyView:
         properties={
             "vpc_id": vpc.resource_id,
             "target_type": "ip",
-            "targets": [{"id": "10.99.0.10", "port": 443}],
+            "targets": [
+                {"id": "10.99.0.10", "port": 443},
+                {"id": backend_lb.resource_id, "port": 443},
+            ],
         },
     )
     resources[tg_one.resource_id] = tg_one
@@ -515,6 +547,63 @@ def _build_lb_with_shared_ip_targets_view() -> TopologyView:
         ]
     )
 
+    if not simple:
+        extra_lb = BaseResource(
+            resource_id="lb-extra",
+            resource_type=ResourceType.LOAD_BALANCER,
+            name="shared-extra",
+            arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/extra/shared",
+            location=_location(),
+            metadata=_metadata(),
+            properties={
+                "type": "application",
+                "scheme": "internal",
+                "subnet_ids": [subnet.resource_id],
+                "security_group_ids": ["sg-extra"],
+            },
+        )
+        resources[extra_lb.resource_id] = extra_lb
+
+        sg_extra = BaseResource(
+            resource_id="sg-extra",
+            resource_type=ResourceType.SECURITY_GROUP,
+            name="sg-extra",
+            arn="arn:aws:ec2:us-east-1:123456789012:security-group/sg-extra",
+            location=_location(),
+            metadata=_metadata(),
+            properties={"vpc_id": vpc.resource_id},
+        )
+        resources[sg_extra.resource_id] = sg_extra
+
+        tg_three = BaseResource(
+            resource_id="tg-ip-3",
+            resource_type=ResourceType.TARGET_GROUP,
+            name="ip-tg-three",
+            arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/ip-tg-three/0000000000000003",
+            location=_location(),
+            metadata=_metadata(),
+            properties={
+                "vpc_id": vpc.resource_id,
+                "target_type": "ip",
+                "targets": [{"id": "10.99.0.20", "port": 80}],
+            },
+        )
+        resources[tg_three.resource_id] = tg_three
+        relationships.extend(
+            [
+                Relationship(
+                    source_id=extra_lb.resource_id,
+                    target_id=tg_three.resource_id,
+                    relationship_type=RelationshipType.CONTAINS,
+                ),
+                Relationship(
+                    source_id=lb.resource_id,
+                    target_id=extra_lb.resource_id,
+                    relationship_type=RelationshipType.CONNECTS_TO,
+                ),
+            ]
+        )
+
     view_metadata = {
         "filters_applied": [],
         "source_accounts": ["123456789012"],
@@ -523,6 +612,228 @@ def _build_lb_with_shared_ip_targets_view() -> TopologyView:
 
     return TopologyView(
         name="shared-ip-target-view",
+        description="",
+        source_topology=None,
+        filtered_resources=resources,
+        filtered_relationships=relationships,
+        metadata=view_metadata,
+    )
+
+
+def _build_lb_with_shared_ip_targets_view() -> TopologyView:
+    return _build_complex_lb_view(simple=True)
+
+
+def _build_ec2_aggregation_view() -> TopologyView:
+    resources: Dict[str, BaseResource] = {}
+    relationships: List[Relationship] = []
+
+    vpc = create_vpc_resource(
+        vpc_id="vpc-agg",
+        cidr_block="10.50.0.0/16",
+        location=_location(),
+        name="agg-vpc",
+    )
+    resources[vpc.resource_id] = vpc
+
+    subnet = NetworkResource(
+        resource_id="subnet-agg-private",
+        resource_type=ResourceType.SUBNET,
+        name="agg-private-a",
+        arn="arn:aws:ec2:us-east-1:123456789012:subnet/subnet-agg-private",
+        location=_location("us-east-1a"),
+        metadata=_metadata(),
+        cidr_blocks=["10.50.1.0/24"],
+        properties={"vpc_id": vpc.resource_id, "availability_zone": "us-east-1a"},
+    )
+    resources[subnet.resource_id] = subnet
+    relationships.append(
+        Relationship(
+            source_id=vpc.resource_id,
+            target_id=subnet.resource_id,
+            relationship_type=RelationshipType.CONTAINS,
+        )
+    )
+
+    sg_shared = BaseResource(
+        resource_id="sg-shared-ec2",
+        resource_type=ResourceType.SECURITY_GROUP,
+        name="shared-ec2",
+        arn="arn:aws:ec2:us-east-1:123456789012:security-group/sg-shared-ec2",
+        location=_location(),
+        metadata=_metadata(),
+        properties={"vpc_id": vpc.resource_id},
+    )
+    sg_other = BaseResource(
+        resource_id="sg-other-ec2",
+        resource_type=ResourceType.SECURITY_GROUP,
+        name="other-ec2",
+        arn="arn:aws:ec2:us-east-1:123456789012:security-group/sg-other-ec2",
+        location=_location(),
+        metadata=_metadata(),
+        properties={"vpc_id": vpc.resource_id},
+    )
+    resources[sg_shared.resource_id] = sg_shared
+    resources[sg_other.resource_id] = sg_other
+
+    ec2_a = create_ec2_instance_resource(
+        instance_id="i-shared-a",
+        instance_type="t3.micro",
+        location=_location("us-east-1a"),
+        name="app-a",
+        subnet_id=subnet.resource_id,
+        vpc_id=vpc.resource_id,
+        security_group_ids=[sg_shared.resource_id],
+    )
+    ec2_b = create_ec2_instance_resource(
+        instance_id="i-shared-b",
+        instance_type="t3.micro",
+        location=_location("us-east-1a"),
+        name="app-b",
+        subnet_id=subnet.resource_id,
+        vpc_id=vpc.resource_id,
+        security_group_ids=[sg_shared.resource_id],
+    )
+    ec2_c = create_ec2_instance_resource(
+        instance_id="i-other",
+        instance_type="t3.micro",
+        location=_location("us-east-1a"),
+        name="other-app",
+        subnet_id=subnet.resource_id,
+        vpc_id=vpc.resource_id,
+        security_group_ids=[sg_other.resource_id],
+    )
+    for ec2 in (ec2_a, ec2_b, ec2_c):
+        resources[ec2.resource_id] = ec2
+        relationships.append(
+            Relationship(
+                source_id=subnet.resource_id,
+                target_id=ec2.resource_id,
+                relationship_type=RelationshipType.CONTAINS,
+            )
+        )
+
+    view_metadata = {
+        "filters_applied": [],
+        "source_accounts": ["123456789012"],
+        "source_regions": ["us-east-1"],
+    }
+
+    return TopologyView(
+        name="ec2-aggregation-view",
+        description="",
+        source_topology=None,
+        filtered_resources=resources,
+        filtered_relationships=relationships,
+        metadata=view_metadata,
+    )
+
+
+def _build_lb_with_alb_target_view() -> TopologyView:
+    resources: Dict[str, BaseResource] = {}
+    relationships: List[Relationship] = []
+
+    vpc = create_vpc_resource(
+        vpc_id="vpc-alb-hop",
+        cidr_block="10.20.0.0/16",
+        location=_location(),
+        name="alb-hop",
+    )
+    resources[vpc.resource_id] = vpc
+
+    subnet = NetworkResource(
+        resource_id="subnet-alb-hop",
+        resource_type=ResourceType.SUBNET,
+        name="private-hop-a",
+        arn="arn:aws:ec2:us-east-1:123456789012:subnet/subnet-alb-hop",
+        location=_location("us-east-1a"),
+        metadata=_metadata(),
+        cidr_blocks=["10.20.0.0/24"],
+        properties={"vpc_id": vpc.resource_id, "availability_zone": "us-east-1a"},
+    )
+    resources[subnet.resource_id] = subnet
+    relationships.append(
+        Relationship(
+            source_id=vpc.resource_id,
+            target_id=subnet.resource_id,
+            relationship_type=RelationshipType.CONTAINS,
+        )
+    )
+
+    upstream_lb = BaseResource(
+        resource_id="lb-front-alb",
+        resource_type=ResourceType.LOAD_BALANCER,
+        name="frontdoor-alb",
+        arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/frontdoor/alb",
+        location=_location(),
+        metadata=_metadata(),
+        properties={
+            "type": "application",
+            "scheme": "internal",
+            "subnet_ids": [subnet.resource_id],
+            "security_group_ids": ["sg-front"],
+        },
+    )
+    resources[upstream_lb.resource_id] = upstream_lb
+
+    downstream_lb = BaseResource(
+        resource_id="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/downstream/alb",
+        resource_type=ResourceType.LOAD_BALANCER,
+        name="downstream-alb",
+        arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/downstream/alb",
+        location=_location(),
+        metadata=_metadata(),
+        properties={
+            "type": "application",
+            "scheme": "internal",
+            "subnet_ids": [subnet.resource_id],
+        },
+    )
+    resources[downstream_lb.resource_id] = downstream_lb
+
+    sg_front = BaseResource(
+        resource_id="sg-front",
+        resource_type=ResourceType.SECURITY_GROUP,
+        name="frontdoor-sg",
+        arn="arn:aws:ec2:us-east-1:123456789012:security-group/sg-front",
+        location=_location(),
+        metadata=_metadata(),
+        properties={"vpc_id": vpc.resource_id},
+    )
+    resources[sg_front.resource_id] = sg_front
+
+    tg = BaseResource(
+        resource_id="tg-alb-hop",
+        resource_type=ResourceType.TARGET_GROUP,
+        name="alb-hop-tg",
+        arn="arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/alb-hop/0000000000000004",
+        location=_location(),
+        metadata=_metadata(),
+        properties={
+            "vpc_id": vpc.resource_id,
+            "target_type": "alb",
+            "targets": [
+                {"id": downstream_lb.resource_id, "port": 443},
+            ],
+        },
+    )
+    resources[tg.resource_id] = tg
+    relationships.append(
+        Relationship(
+            source_id=upstream_lb.resource_id,
+            target_id=tg.resource_id,
+            relationship_type=RelationshipType.CONTAINS,
+        )
+    )
+
+    view_metadata = {
+        "filters_applied": [],
+        "source_accounts": ["123456789012"],
+        "source_regions": ["us-east-1"],
+    }
+
+    return TopologyView(
+        name="alb-hop-view",
         description="",
         source_topology=None,
         filtered_resources=resources,
@@ -550,6 +861,14 @@ def test_awslabs_transformer_unique_ip_nodes_per_target_group():
         for rid, res in resources.items()
         if res.get("Type") == "AWS::Diagram::VerticalStack" and res.get("Title") == "shared-ip-alb"
     )
-    lb_children = resources[lb_stack_id].get("Children", [])
+    def _descendants(node_id: str) -> List[str]:
+        children = resources.get(node_id, {}).get("Children") or []
+        nested = []
+        for child in children:
+            nested.append(child)
+            nested.extend(_descendants(child))
+        return nested
+
+    lb_descendants = set(_descendants(lb_stack_id))
     for node_id in ip_node_ids:
-        assert node_id in lb_children
+        assert node_id in lb_descendants

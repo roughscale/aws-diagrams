@@ -109,6 +109,7 @@ class GraphNode:
     # AWS-specific properties
     resource_type: Optional[ResourceType] = None
     aws_service_type: Optional[str] = None  # e.g., "AWS::EC2::Instance"
+    resource: Optional[Any] = None  # Original resource reference (BaseResource)
 
     # Layout hints
     layout_type: Optional[LayoutType] = None

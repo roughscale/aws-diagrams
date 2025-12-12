@@ -36,6 +36,8 @@ class ResourceType(Enum):
     TRANSIT_GATEWAY = "transit_gateway"
     VPC_PEERING = "vpc_peering"
     NETWORK_INTERFACE = "network_interface"
+    CLOUDFRONT_DISTRIBUTION = "cloudfront_distribution"
+    GLOBAL_ACCELERATOR = "global_accelerator"
 
 
 class RelationshipType(Enum):

@@ -15,6 +15,8 @@ from .rds_collector import RDSCollector
 from .elasticache_collector import ElastiCacheCollector
 from .opensearch_collector import OpenSearchCollector
 from .redshift_collector import RedshiftCollector
+from .cloudfront_collector import CloudFrontCollector
+from .global_accelerator_collector import GlobalAcceleratorCollector
 
 __all__ = [
     'BaseCollector',
@@ -28,5 +30,7 @@ __all__ = [
     'RDSCollector',
     'ElastiCacheCollector',
     'OpenSearchCollector',
-    'RedshiftCollector'
+    'RedshiftCollector',
+    'CloudFrontCollector',
+    'GlobalAcceleratorCollector',
 ]

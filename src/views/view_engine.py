@@ -57,7 +57,10 @@ class ViewFilter:
                 match = resource.resource_id in self.values
             else:
                 vpc_id = resource.properties.get('vpc_id')
-                match = vpc_id in self.values if vpc_id else False
+                if not vpc_id and (resource.location.region or "").lower() in {"aws-global", "global"}:
+                    match = True
+                else:
+                    match = vpc_id in self.values if vpc_id else False
         elif self.filter_type == FilterType.TAG:
             # Check if resource has any of the specified tag key=value pairs
             match = False
@@ -472,6 +475,14 @@ class ViewEngine:
                         vpc_resources[resource_id] = resource
                         logger.debug(f"Including ECS cluster {resource.name} because service {vpc_resource.name} is in VPC {vpc_id}")
                         break
+
+        # Include global edge services that are account-wide (e.g., CloudFront, Global Accelerator)
+        for account in self.topology.organization.accounts.values():
+            global_region = account.regions.get("aws-global")
+            if not global_region:
+                continue
+            for rid, resource in global_region.resources.items():
+                vpc_resources[rid] = resource
 
         # Apply optional explicit filters for account/region without cross-account expansion
         if account_id:

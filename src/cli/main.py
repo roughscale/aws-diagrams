@@ -9,7 +9,7 @@ import click
 import os
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Set, Dict, Any
 
 # Load environment variables from .env file
 try:
@@ -168,6 +168,22 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from ..collectors.redshift_collector import RedshiftCollector  # type: ignore
         except Exception:
             RedshiftCollector = None  # type: ignore
+        try:
+            from ..collectors.cloudfront_collector import CloudFrontCollector  # type: ignore
+        except Exception:
+            CloudFrontCollector = None  # type: ignore
+        try:
+            from ..collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
+        except Exception:
+            GlobalAcceleratorCollector = None  # type: ignore
+        try:
+            from ..collectors.cloudfront_collector import CloudFrontCollector  # type:ignore
+        except Exception:
+            CloudFrontCollector = None  # type: ignore
+        try:
+            from ..collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
+        except Exception:
+            GlobalAcceleratorCollector = None  # type: ignore
         from ..auth import MultiAccountAuthenticator
         from ..topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         try:
@@ -205,12 +221,29 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             from collectors.redshift_collector import RedshiftCollector  # type: ignore
         except Exception:
             RedshiftCollector = None  # type: ignore
+        try:
+            from collectors.cloudfront_collector import CloudFrontCollector  # type: ignore
+        except Exception:
+            CloudFrontCollector = None  # type: ignore
+        try:
+            from collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
+        except Exception:
+            GlobalAcceleratorCollector = None  # type: ignore
+        try:
+            from collectors.cloudfront_collector import CloudFrontCollector  # type: ignore
+        except Exception:
+            CloudFrontCollector = None  # type: ignore
+        try:
+            from collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
+        except Exception:
+            GlobalAcceleratorCollector = None  # type: ignore
         from auth import MultiAccountAuthenticator
         from topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         from topology.serializer import TopologyYAMLSerializer
     from datetime import datetime
     
     logger.info(f"Starting collection for account {account_id}")
+    target_vpc_ids: Set[str] = set(vpc_ids)
     
     # Determine regions to collect from
     if not regions:
@@ -286,6 +319,45 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
         total_relationships = 0
         total_api_calls = 0
         
+        available_collectors = {
+            'vpc': VPCCollector,
+            'ec2': EC2Collector,
+        }
+        if 'ECSCollector' in locals() and ECSCollector:
+            available_collectors['ecs'] = ECSCollector  # type: ignore
+        if 'ELBV2Collector' in locals() and ELBV2Collector:
+            available_collectors['elbv2'] = ELBV2Collector  # type: ignore
+        if 'LambdaCollector' in locals() and LambdaCollector:
+            available_collectors['lambda'] = LambdaCollector  # type: ignore
+        if 'RDSCollector' in locals() and RDSCollector:
+            available_collectors['rds'] = RDSCollector  # type: ignore
+        if 'ElastiCacheCollector' in locals() and ElastiCacheCollector:
+            available_collectors['elasticache'] = ElastiCacheCollector  # type: ignore
+        if 'OpenSearchCollector' in locals() and OpenSearchCollector:
+            available_collectors['opensearch'] = OpenSearchCollector  # type: ignore
+        if 'RedshiftCollector' in locals() and RedshiftCollector:
+            available_collectors['redshift'] = RedshiftCollector  # type: ignore
+
+        global_collector_classes: Dict[str, Any] = {}
+        if 'CloudFrontCollector' in locals() and CloudFrontCollector:
+            global_collector_classes['cloudfront'] = CloudFrontCollector  # type: ignore
+        if 'GlobalAcceleratorCollector' in locals() and GlobalAcceleratorCollector:
+            global_collector_classes['globalaccelerator'] = GlobalAcceleratorCollector  # type: ignore
+
+        if collectors:
+            collectors_lower = [c.lower() for c in collectors]
+            selected_collectors = {
+                name: cls for name, cls in available_collectors.items()
+                if name in collectors_lower
+            }
+            selected_global_collectors = {
+                name: cls for name, cls in global_collector_classes.items()
+                if name in collectors_lower
+            }
+        else:
+            selected_collectors = available_collectors
+            selected_global_collectors = global_collector_classes
+
         # Collect from each region
         for region in regions:
             logger.info(f"Collecting from region {region}")
@@ -299,34 +371,6 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
                 region_session = authenticator.get_authenticated_session(account_id, region, role_name)
             
             region_data = account_data.add_region(region)
-            
-            # Determine which collectors to run
-            available_collectors = {
-                'vpc': VPCCollector,
-                'ec2': EC2Collector,
-            }
-            if 'ECSCollector' in locals() and ECSCollector:
-                available_collectors['ecs'] = ECSCollector  # type: ignore
-            if 'ELBV2Collector' in locals() and ELBV2Collector:
-                available_collectors['elbv2'] = ELBV2Collector  # type: ignore
-            if 'LambdaCollector' in locals() and LambdaCollector:
-                available_collectors['lambda'] = LambdaCollector  # type: ignore
-            if 'RDSCollector' in locals() and RDSCollector:
-                available_collectors['rds'] = RDSCollector  # type: ignore
-            if 'ElastiCacheCollector' in locals() and ElastiCacheCollector:
-                available_collectors['elasticache'] = ElastiCacheCollector  # type: ignore
-            if 'OpenSearchCollector' in locals() and OpenSearchCollector:
-                available_collectors['opensearch'] = OpenSearchCollector  # type: ignore
-            if 'RedshiftCollector' in locals() and RedshiftCollector:
-                available_collectors['redshift'] = RedshiftCollector  # type: ignore
-            
-            if collectors:
-                selected_collectors = {
-                    name: cls for name, cls in available_collectors.items() 
-                    if name in collectors
-                }
-            else:
-                selected_collectors = available_collectors
             
             # Run collectors. If VPC IDs provided, run VPC collector first to discover subnets,
             # then pass the subnet set to other collectors for filtering.
@@ -376,6 +420,56 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
                         ]
                     except Exception:
                         collected_subnet_ids = []
+
+        # Run global collectors once (CloudFront, Global Accelerator, etc.)
+        for collector_name, collector_class in selected_global_collectors.items():
+            global_region_label = getattr(collector_class, "GLOBAL_REGION", "aws-global")
+            control_region = getattr(
+                collector_class,
+                "CONTROL_PLANE_REGION",
+                global_region_label,
+            )
+
+            logger.info(
+                f"Running global collector {collector_name} using control plane region {control_region}"
+            )
+
+            if direct_access or not role_name or role_name.strip() == "":
+                global_session = boto3.Session(
+                    profile_name=profile, region_name=control_region
+                )
+            else:
+                global_session = authenticator.get_authenticated_session(
+                    account_id, control_region, role_name
+                )
+
+            collector = collector_class(
+                session=global_session,
+                account_id=account_id,
+                region=global_region_label,
+                vpc_ids=None,
+                allowed_subnet_ids=None,
+            )
+
+            try:
+                results = collector.run_collection()
+            except Exception as exc:
+                logger.warning(f"Collector {collector_name} failed: {exc}")
+                continue
+
+            region_data = account_data.add_region(global_region_label)
+            for resource in collector.collected_resources.values():
+                region_data.add_resource(resource)
+            region_data.relationships.extend(collector.discovered_relationships)
+
+            total_resources += results["resources_collected"]
+            total_relationships += results["relationships_discovered"]
+            total_api_calls += results["api_calls_made"]
+
+            if results.get("collection_failed", False):
+                logger.warning(
+                    f"Collector {collector_name} failed: {results.get('failure_reason')}"
+                )
         
         # Update topology metadata
         topology.metadata.total_resources = total_resources
@@ -387,30 +481,16 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
         if append and output_path.exists():
             try:
                 existing = serializer.load_from_file(output_path)
-                # Merge account regions into existing topology
-                new_org = topology.organization
-                new_acct = new_org.accounts.get(account_id)
-                if not new_acct:
-                    logger.warning("No account data collected to append. Saving existing file unchanged.")
-                else:
-                    if account_id in existing.organization.accounts:
-                        existing_acct = existing.organization.accounts[account_id]
-                        # Merge/replace regions
-                        for region_name, region_data in new_acct.regions.items():
-                            existing_acct.regions[region_name] = region_data
-                        # Extend cross-region relationships
-                        existing_acct.cross_region_relationships.extend(new_acct.cross_region_relationships)
-                        existing_acct.last_updated = new_acct.last_updated
-                    else:
-                        # Add whole account if not present
-                        existing.organization.accounts[account_id] = new_acct
-                    # Merge cross-account relationships
-                    existing.organization.cross_account_relationships.extend(new_org.cross_account_relationships)
-                    # Recompute simple metadata counters
-                    existing.metadata.total_accounts = len(existing.organization.accounts)
-                    existing.metadata.total_regions = sum(len(a.regions) for a in existing.organization.accounts.values())
-                    existing.metadata.total_resources = sum(len(r.resources) for a in existing.organization.accounts.values() for r in a.regions.values())
-                # Save merged topology
+                _merge_account_data(existing, topology, account_id, target_vpc_ids)
+                existing.metadata.total_accounts = len(existing.organization.accounts)
+                existing.metadata.total_regions = sum(
+                    len(acct.regions) for acct in existing.organization.accounts.values()
+                )
+                existing.metadata.total_resources = sum(
+                    len(region.resources)
+                    for acct in existing.organization.accounts.values()
+                    for region in acct.regions.values()
+                )
                 serializer.save_to_file(existing, output_path)
                 logger.info(f"Collection completed successfully. Appended data to {output}")
             except Exception as e:
@@ -547,8 +627,8 @@ def generate(ctx):
 @click.option(
     '--format',
     type=click.Choice(['awslabs', 'awslabs-v2', 'drawio', 'd2', 'plantuml'], case_sensitive=False),
-    default='awslabs',
-    help='Diagram format (awslabs-v2 uses new generic graph model)'
+    default='awslabs-v2',
+    help='Diagram format (awslabs is legacy; awslabs-v2 is the default)'
 )
 @click.pass_context
 def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[str], 
@@ -596,14 +676,10 @@ def generate_vpc_diagram(ctx, topology: str, vpc_id: str, account_id: Optional[s
         logger.info(f"Created view with {len(view.filtered_resources)} resources")
         
         # Transform based on format
-        if format.lower() == 'awslabs':
-            transformer = AWSLabsTransformer(view)
-            transformer.save_to_file(output)
-            logger.info(f"AWS Labs diagram saved to {output}")
-        elif format.lower() == 'awslabs-v2':
+        if format.lower() in ('awslabs-v2', 'awslabs'):
             transformer = AWSLabsTransformerV2(view)
             transformer.save_to_file(output)
-            logger.info(f"AWS Labs V2 diagram (using generic graph model) saved to {output}")
+            logger.info(f"AWS Labs diagram saved to {output}")
         elif format.lower() == 'drawio':
             transformer = DrawioTransformer(view)
             transformer.save_to_file(output)
@@ -737,3 +813,65 @@ def stats(ctx, topology: str):
 
 if __name__ == '__main__':
     cli()
+def _merge_account_data(existing_topology, new_topology, account_id: str, target_vpc_ids: Set[str]) -> None:
+    """Merge collected topology into an existing topology while preserving other VPCs.
+
+    When ``target_vpc_ids`` is non-empty, only resources belonging to the newly
+    collected VPCs are replaced; everything else in the account/region is left
+    untouched. When the set is empty, the account/region data is fully replaced
+    (legacy behaviour).
+    """
+
+    new_account = new_topology.organization.accounts.get(account_id)
+    if not new_account:
+        return
+
+    if account_id not in existing_topology.organization.accounts:
+        existing_topology.organization.accounts[account_id] = new_account
+        return
+
+    existing_account = existing_topology.organization.accounts[account_id]
+
+    if not target_vpc_ids:
+        existing_topology.organization.accounts[account_id] = new_account
+        return
+
+    removed_resource_ids: Set[str] = set()
+
+    for region_name, new_region in new_account.regions.items():
+        new_resource_ids = set(new_region.resources.keys())
+        removed_resource_ids.update(new_resource_ids)
+
+        if region_name in existing_account.regions:
+            existing_region = existing_account.regions[region_name]
+
+            for rid in new_resource_ids:
+                existing_region.resources.pop(rid, None)
+
+            existing_region.relationships = [
+                rel
+                for rel in existing_region.relationships
+                if rel.source_id not in new_resource_ids and rel.target_id not in new_resource_ids
+            ]
+
+            existing_region.resources.update(new_region.resources)
+            existing_region.relationships.extend(new_region.relationships)
+        else:
+            existing_account.regions[region_name] = new_region
+
+    if removed_resource_ids:
+        existing_account.cross_region_relationships = [
+            rel
+            for rel in existing_account.cross_region_relationships
+            if rel.source_id not in removed_resource_ids and rel.target_id not in removed_resource_ids
+        ]
+        existing_topology.organization.cross_account_relationships = [
+            rel
+            for rel in existing_topology.organization.cross_account_relationships
+            if rel.source_resource not in removed_resource_ids and rel.target_resource not in removed_resource_ids
+        ]
+
+    existing_account.cross_region_relationships.extend(new_account.cross_region_relationships)
+    existing_topology.organization.cross_account_relationships.extend(
+        new_topology.organization.cross_account_relationships
+    )
