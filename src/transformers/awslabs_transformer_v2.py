@@ -103,6 +103,8 @@ class AWSLabsTransformerV2:
         ResourceType.NETWORK_INTERFACE: "AWS::EC2::NetworkInterface",
         ResourceType.CLOUDFRONT_DISTRIBUTION: "AWS::CloudFront::Distribution",
         ResourceType.GLOBAL_ACCELERATOR: "AWS::GlobalAccelerator::Accelerator",
+        ResourceType.ROUTE53_HOSTED_ZONE: "AWS::Route53::HostedZone",
+        ResourceType.ROUTE53_RECORD: "AWS::Route53::RecordSet",
     }
     
     # Icons for different resource types
@@ -118,6 +120,8 @@ class AWSLabsTransformerV2:
         ResourceType.LAMBDA_FUNCTION: "LambdaFunction",
         ResourceType.CLOUDFRONT_DISTRIBUTION: "CloudFrontDistribution",
         ResourceType.GLOBAL_ACCELERATOR: "GlobalAccelerator",
+        ResourceType.ROUTE53_HOSTED_ZONE: "Route53HostedZone",
+        ResourceType.ROUTE53_RECORD: "Route53HostedZone",
     }
     
     def __init__(self, view: TopologyView, logical_subnets_enabled: bool = True):
@@ -145,8 +149,13 @@ class AWSLabsTransformerV2:
         self._cluster_lb_owner: Dict[str, str] = {}
         self._cluster_lb_consumers: Set[str] = set()
         self._lb_service_links: Set[Tuple[str, str]] = set()
+        self._tg_service_map: Dict[str, List[str]] = {}
         self._lb_stack_debug: Dict[str, List[str]] = {}
         self._global_resource_ids: List[str] = []
+        self._resource_render_map: Dict[str, str] = {}
+        self._global_service_ids: Set[str] = set()
+        self._global_service_links: Set[Tuple[str, str]] = set()
+        self._linked_global_service_ids: Set[str] = set()
 
     @staticmethod
     def _to_relationship_type(value: Optional[str]) -> Optional[RelationshipType]:
@@ -171,6 +180,8 @@ class AWSLabsTransformerV2:
                 self.resources[node_id] = resource
 
         self.relationships = []
+        self._lb_service_links = set()
+        self._tg_service_map = {}
         for edge in graph.edges.values():
             rel_type = self._to_relationship_type(edge.relationship_type)
             if not rel_type:
@@ -183,10 +194,18 @@ class AWSLabsTransformerV2:
                     properties=edge.properties or {},
                 )
             )
+            if rel_type == RelationshipType.TARGETS:
+                self._lb_service_links.add((edge.source_id, edge.target_id))
+                via_tg = (edge.properties or {}).get("via_tg")
+                if via_tg:
+                    self._tg_service_map.setdefault(str(via_tg), []).append(edge.target_id)
         
     def transform(self) -> Dict[str, Any]:
         """Transform the topology view into AWS Labs diagram-as-code format."""
         logger.info(f"Transforming view '{self.view.name}' to AWS Labs format")
+        self._resource_render_map = {}
+        self._global_service_ids = set()
+        self._global_service_links = set()
 
         base_builder = _GraphBuilder(self.view)
         base_builder.logical_subnets_enabled = self.logical_subnets_enabled
@@ -218,6 +237,8 @@ class AWSLabsTransformerV2:
     def _create_resource_nodes(self) -> None:
         """Create diagram nodes for each resource in the view."""
         for resource_id, resource in self.resources.items():
+            if self._is_render_suppressed(resource_id):
+                continue
             node = self._create_node_from_resource(resource)
             self.nodes[resource_id] = node
 
@@ -245,6 +266,15 @@ class AWSLabsTransformerV2:
             }
             row_ids.append(row_id)
         return row_ids
+
+    def _is_render_suppressed(self, resource_id: str) -> bool:
+        """Return True if the graph node indicates this resource should not be rendered."""
+        if not self.graph:
+            return False
+        node = self.graph.nodes.get(resource_id)
+        if not node:
+            return False
+        return bool((node.properties or {}).get("render") is False)
     
     def _create_node_from_resource(self, resource: BaseResource) -> DiagramNode:
         """Create a diagram node from a topology resource."""
@@ -338,7 +368,17 @@ class AWSLabsTransformerV2:
                 properties["Engine"] = resource.engine
             if hasattr(resource, 'instance_class'):
                 properties["InstanceClass"] = resource.instance_class
-        
+
+        elif resource.resource_type == ResourceType.ROUTE53_HOSTED_ZONE:
+            properties["HostedZoneId"] = resource.resource_id
+            properties["PrivateZone"] = resource.properties.get("private_zone")
+            properties["RecordCount"] = resource.properties.get("resource_record_set_count")
+
+        elif resource.resource_type == ResourceType.ROUTE53_RECORD:
+            properties["RecordType"] = resource.properties.get("type")
+            properties["TTL"] = resource.properties.get("ttl")
+            properties["TargetDnsNames"] = resource.properties.get("target_dns_names")
+    
         # Add tags as properties
         if resource.metadata.tags:
             properties["Tags"] = resource.metadata.tags
@@ -506,8 +546,6 @@ class AWSLabsTransformerV2:
             "Children": row_children
         }
 
-        resources["AWSCloud"]["Children"].append("VpcRow")
-        
         # Add VPC resources
         self._add_vpc_resources(resources)
         
@@ -516,15 +554,23 @@ class AWSLabsTransformerV2:
         
         # Add other AWS resources (but skip individual subnets as they're now grouped)
         self._add_aws_resources(resources)
+        self._build_global_service_links()
 
-        if self._global_resource_ids:
+        aws_cloud_children: List[str] = []
+        filtered_globals = [
+            node_id
+            for node_id in self._global_resource_ids
+            if self._should_include_global_resource(node_id)
+        ]
+        if filtered_globals:
             resources["GlobalServicesStack"] = {
                 "Type": "AWS::Diagram::HorizontalStack",
                 "Title": "Global Edge Services",
-                "Children": self._global_resource_ids,
+                "Children": filtered_globals,
             }
-            resources["AWSCloud"]["Children"].append("GlobalServicesStack")
-        
+            aws_cloud_children.append("GlobalServicesStack")
+        aws_cloud_children.append("VpcRow")
+        resources["AWSCloud"]["Children"] = aws_cloud_children
         # Create links from relationships and synthesized intents
         links = self._create_links(resources)
         
@@ -580,6 +626,7 @@ class AWSLabsTransformerV2:
                     "Title": resource.name or resource_id,
                     "Children": vpc_children
                 }
+                self._register_render_node(resource_id)
 
                 if border_children:
                     resources[resource_id]["BorderChildren"] = border_children
@@ -625,8 +672,10 @@ class AWSLabsTransformerV2:
             tgt = self.resources.get(rel.target_id)
             if not src or not tgt:
                 continue
-            if (src.resource_type == ResourceType.NETWORK_INTERFACE and
-                    tgt.resource_type == ResourceType.EC2_INSTANCE):
+            if (
+                src.resource_type == ResourceType.NETWORK_INTERFACE
+                and self._supports_eni_dedup_for(tgt)
+            ):
                 eni_to_instance[src.resource_id] = tgt.resource_id
 
         for rid, res in self.resources.items():
@@ -638,13 +687,18 @@ class AWSLabsTransformerV2:
                 or attachment.get('instanceId')
                 or attachment.get('instance_id')
             )
-            if instance_id:
+            if not instance_id:
+                continue
+            owner_resource = self.resources.get(str(instance_id))
+            if owner_resource and self._supports_eni_dedup_for(owner_resource):
                 eni_to_instance.setdefault(rid, str(instance_id))
 
         self._eni_instance_map = eni_to_instance.copy()
 
         synthetic_instances: Dict[str, BaseResource] = {}
-        lb_owned_instances: Set[str] = set(eni_to_instance.values())
+        lb_owned_instances: Set[str] = set(
+            value for value in eni_to_instance.values() if value
+        )
         additions: List[str] = []
         # Precompute Lambda targets from all TGs to avoid multi-parenting
         tg_lambda_target_ids: set = set()
@@ -817,6 +871,7 @@ class AWSLabsTransformerV2:
                                 "Type": "AWS::ECS::Service",
                                 "Title": svc_info['name'] or svc_info['id']
                             }
+                            self._register_render_node(svc_info['id'], service_node_id)
                             resources[cluster_node_id]["Children"].append(service_node_id)
                     else:
                         # Services with security groups - create shared SG containers
@@ -830,6 +885,7 @@ class AWSLabsTransformerV2:
                                 "Type": "AWS::ECS::Service",
                                 "Title": svc_info['name'] or svc_info['id']
                             }
+                            self._register_render_node(svc_info['id'], service_node_id)
                             service_nodes.append(service_node_id)
 
                         # Wrap in shared security group containers (innermost to outermost)
@@ -954,6 +1010,7 @@ class AWSLabsTransformerV2:
                     "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
                     "Title": lb_title,
                 }
+                self._register_render_node(lb_id, lb_node_id)
 
                 # Wrap LB in its security groups (SG-first principle)
                 lb_wrapped_node = lb_node_id
@@ -978,6 +1035,7 @@ class AWSLabsTransformerV2:
                         current_container = sg_container_id
 
                     lb_wrapped_node = current_container
+                self._register_render_node(lb_id, lb_wrapped_node)
 
                 # Process target groups for this LB
                 lb_tg_sections: List[str] = []
@@ -1005,6 +1063,7 @@ class AWSLabsTransformerV2:
                     lambda_targets = []
                     ec2_targets = []
                     ip_targets: List[Tuple[dict, str]] = []
+                    tg_service_ids = self._tg_service_map.get(tg_id, [])
 
                     for svc_id, svc in self.resources.items():
                         if svc.resource_type != ResourceType.ECS_SERVICE:
@@ -1050,6 +1109,41 @@ class AWSLabsTransformerV2:
                         if sgs:
                             tg_entry["tg_sg_sets"].append({str(sg) for sg in sgs})
 
+                    # Ensure ECS services mapped to this TG are represented in cluster refs
+                    for svc_id in tg_service_ids:
+                        cluster_info = global_ecs_service_tracking.get(svc_id)
+                        if not cluster_info:
+                            continue
+                        cluster_node_id = cluster_info['cluster_node_id']
+                        cluster_ref = cluster_ref_map.get(cluster_node_id)
+                        if not cluster_ref:
+                            cluster_ref = {
+                                "cluster_node_id": cluster_node_id,
+                                "same_group": self._cluster_parent.get(cluster_node_id) == group_node_id,
+                                "services": set(),
+                                "sg_signatures": set(),
+                                "tg_entry": tg_entry,
+                                "aggregated": False,
+                            }
+                            cluster_ref_map[cluster_node_id] = cluster_ref
+                            tg_entry["cluster_refs"].append(cluster_ref)
+                            agg = cluster_agg_data.setdefault(
+                                cluster_node_id,
+                                {"refs": [], "sg_signatures": set(), "services": set()},
+                            )
+                            agg["refs"].append(cluster_ref)
+
+                        cluster_ref["services"].add(svc_id)
+                        svc = self.resources.get(svc_id)
+                        sgs = (svc.properties or {}).get('security_group_ids', []) if svc else []
+                        sg_sig = tuple(sorted(sgs)) if sgs else ("no-sg",)
+                        cluster_ref["sg_signatures"].add(sg_sig)
+                        agg = cluster_agg_data[cluster_node_id]
+                        agg["sg_signatures"].add(sg_sig)
+                        agg["services"].add(svc_id)
+                        if sgs:
+                            tg_entry["tg_sg_sets"].append({str(sg) for sg in sgs})
+
                     for target in tg.properties.get('targets') or []:
                         tid = target.get('id')
                         if not tid:
@@ -1074,6 +1168,9 @@ class AWSLabsTransformerV2:
                                 continue
                             ip_targets.append((target, ip_str))
 
+                    # If TG is already mapped to ECS services, do not render IP targets
+                    if tg_service_ids:
+                        ip_targets = []
                     if lambda_targets:
                         lambda_section_id = f"lambda-section-{tg_id}-in-{group_key}"
                         lambda_nodes = []
@@ -1215,7 +1312,6 @@ class AWSLabsTransformerV2:
                                 target_group = self._group_parent.get(target_lb_id)
                                 if target_group:
                                     target_node_id = f"lb-{target_lb_id}-in-{target_group}"
-                                    self._lb_service_links.add((lb_node_id, target_node_id))
                                     continue
                             mapped_svc = self._find_service_id_by_ip(ip)
                             if mapped_svc:
@@ -1253,8 +1349,7 @@ class AWSLabsTransformerV2:
                                         "Title": "\n".join(title_lines),
                                     }
                             ip_nodes.append(ip_node_id)
-                            if tg_entry["is_ip_target_group"]:
-                                self._lb_service_links.add((lb_node_id, ip_node_id))
+
                     if ip_nodes:
                         if len(ip_nodes) == 1:
                             tg_entry["non_cluster_sections"].extend(ip_nodes)
@@ -1269,7 +1364,7 @@ class AWSLabsTransformerV2:
                             tg_entry["non_cluster_sections"].append(stack_id)
                         logger.debug("TG %s non-cluster sections: %s", tg_id, tg_entry["non_cluster_sections"])
 
-                    tg_entries.append(tg_entry)
+                tg_entries.append(tg_entry)
 
                 aggregated_clusters: Dict[str, Dict[str, Any]] = {}
                 for cluster_id, data in cluster_agg_data.items():
@@ -1315,10 +1410,9 @@ class AWSLabsTransformerV2:
                             )
                             cluster_section_roots.append(proj_id)
                         else:
-                            badge_id = self._ensure_cluster_badge(
-                                resources, ref["cluster_node_id"], lb_id, tg_entry["tg_id"]
-                            )
-                            sections.append(badge_id)
+                            # Cross-subnet backends: keep cluster/services in their own subnet.
+                            # Links are provided via graph edges.
+                            pass
 
                     filtered_sg_sets = [s for s in tg_entry["tg_sg_sets"] if s]
                     logger.debug("TG %s filtered SG sets: %s", tg_entry["tg_id"], filtered_sg_sets)
@@ -1365,18 +1459,22 @@ class AWSLabsTransformerV2:
                     # Continue processing next TG entry; SG grouping and stack assembly run after the loop
 
                 for cluster_id, agg in aggregated_clusters.items():
-                    display_id = self._attach_cluster_display(
-                        resources,
-                        cluster_id,
-                        agg["sg_id"],
-                        agg["services"],
-                        lb_node_id,
-                        lb_id,
-                        "aggregated",
-                        group_key,
-                        clusters_reassigned,
-                    )
-                    lb_tg_sections.append(display_id)
+                    if self._cluster_parent.get(cluster_id) == group_key:
+                        display_id = self._attach_cluster_display(
+                            resources,
+                            cluster_id,
+                            agg["sg_id"],
+                            agg["services"],
+                            lb_node_id,
+                            lb_id,
+                            "aggregated",
+                            group_key,
+                            clusters_reassigned,
+                        )
+                        lb_tg_sections.append(display_id)
+                    else:
+                        # Cross-subnet backends are linked via graph edges only.
+                        pass
 
                 for idx, sg_id in enumerate(lb_tg_group_order, start=1):
                     tg_nodes = lb_tg_groups.get(sg_id, [])
@@ -1412,7 +1510,18 @@ class AWSLabsTransformerV2:
                         }
                         lb_tg_sections.append(container_id)
                     else:
-                        lb_tg_sections.extend(group_children)
+                        if len(group_children) > 1:
+                            no_sg_stack_id = (
+                                f"lb-{self._sanitize_identifier(lb_id)}-tg-nosg-stack-"
+                                f"{idx}-in-{group_key}"
+                            )
+                            resources[no_sg_stack_id] = {
+                                "Type": "AWS::Diagram::HorizontalStack",
+                                "Children": group_children,
+                            }
+                            lb_tg_sections.append(no_sg_stack_id)
+                        else:
+                            lb_tg_sections.extend(group_children)
 
                 logger.debug("LB %s sections before fallback: %s", lb_id, lb_tg_sections)
                 stack_id = self._build_lb_stack(
@@ -1425,6 +1534,7 @@ class AWSLabsTransformerV2:
                 logger.debug("Stack id result for %s: %s", lb_id, stack_id)
                 if stack_id:
                     lb_stack_ids.append(stack_id)
+                    self._register_render_node(lb_id, stack_id)
                 else:
                     logger.debug("No stack built for %s (sections=%s)", lb_id, lb_tg_sections)
 
@@ -1568,9 +1678,13 @@ class AWSLabsTransformerV2:
             group_instance_ids: Set[str] = set()
             for rid2, res2 in self.resources.items():
                 if res2.resource_type == ResourceType.NETWORK_INTERFACE and res2.properties.get('subnet_id') in subnet_set:
+                    if self._is_render_suppressed(rid2):
+                        continue
                     desc = (res2.properties.get('description') or '').lower()
                     sgs = set(res2.properties.get('security_group_ids') or [])
                     iface_type = (res2.properties.get('interface_type') or '').lower()
+                    if self._is_global_service_eni(res2):
+                        continue
                     if rid2 in eni_to_instance:
                         group_instance_ids.add(eni_to_instance[rid2])
                         continue
@@ -1825,7 +1939,8 @@ class AWSLabsTransformerV2:
     def _add_aws_resources(self, resources: Dict[str, Any]) -> None:
         """Add AWS resources to the diagram."""
         for resource_id, resource in self.resources.items():
-            if resource_id in resources:  # Skip if already added
+            node_id = self._diagram_node_id(resource)
+            if node_id in resources:  # Skip if already added
                 continue
                 
             service_type = self.RESOURCE_TYPE_MAPPING.get(
@@ -1872,7 +1987,10 @@ class AWSLabsTransformerV2:
                 resource_def["Title"] = self._format_title_with_ips(title, ips)
 
             elif resource.resource_type == ResourceType.NETWORK_INTERFACE:
-                if resource_id in self._eni_instance_map:
+                if self._is_global_service_eni(resource):
+                    continue
+                owner_resource = self._find_eni_owner_resource(resource_id)
+                if owner_resource and self._supports_eni_dedup_for(owner_resource):
                     continue
                 vpce_info = self._get_vpce_for_eni(resource_id)
                 if vpce_info and self._is_aws_managed_vpce(vpce_info[0], vpce_info[1]):
@@ -1880,8 +1998,18 @@ class AWSLabsTransformerV2:
                 # Show ENI private IP beneath the title
                 title = resource.name or resource_id
                 ip = (resource.properties or {}).get('private_ip')
+                title_lines = [title]
                 if ip:
-                    resource_def["Title"] = f"{title}\n{ip}"
+                    title_lines.append(str(ip))
+                if owner_resource:
+                    owner_label = owner_resource.name or owner_resource.resource_id
+                    owner_type = owner_resource.resource_type.value.replace("_", " ").title()
+                    title_lines.append(f"Attached to: {owner_label} ({owner_type})")
+                else:
+                    inferred = self._infer_eni_owner_label(resource)
+                    if inferred:
+                        title_lines.append(f"Attached to: {inferred}")
+                resource_def["Title"] = "\n".join(title_lines)
                     
             elif resource.resource_type == ResourceType.INTERNET_GATEWAY:
                 # Internet Gateway styling
@@ -1896,13 +2024,22 @@ class AWSLabsTransformerV2:
             elif resource.resource_type == ResourceType.VPC_PEERING:
                 # Skip standalone peering nodes; we render peering indicators under VPC panels
                 continue
+            elif resource.resource_type == ResourceType.ROUTE53_RECORD:
+                # Route53 records are collected for linking but not shown individually
+                continue
             
-            resources[resource_id] = resource_def
+            resources[node_id] = resource_def
+            self._register_render_node(resource_id, node_id)
 
             region_label = getattr(getattr(resource, "location", None), "region", "")
             if region_label and region_label.lower() in {"aws-global", "global"}:
-                if resource_id not in self._global_resource_ids:
-                    self._global_resource_ids.append(resource_id)
+                if node_id not in self._global_resource_ids:
+                    self._global_resource_ids.append(node_id)
+            if resource.resource_type in (
+                ResourceType.GLOBAL_ACCELERATOR,
+                ResourceType.CLOUDFRONT_DISTRIBUTION,
+            ):
+                self._global_service_ids.add(resource_id)
     
     def _create_links(self, resources: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Create links for the diagram.
@@ -1911,18 +2048,41 @@ class AWSLabsTransformerV2:
         to preserve the layout and avoid SG/membership link noise.
         """
         links: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str]] = set()
 
         for lb_id, svc_id in sorted(self._lb_service_links):
-            if lb_id not in resources or svc_id not in resources:
+            source_id = self._resource_render_map.get(lb_id, lb_id)
+            target_id = self._resource_render_map.get(svc_id, svc_id)
+            if source_id not in resources or target_id not in resources:
                 continue
+            key = (source_id, target_id)
+            if key in seen:
+                continue
+            seen.add(key)
             link = {
-                "Source": lb_id,
-                "Target": svc_id,
+                "Source": source_id,
+                "Target": target_id,
                 "Type": "orthogonal",
                 "SourcePosition": "S",
                 "TargetPosition": "N",
             }
             links.append(link)
+        for source_id, target_id in sorted(self._global_service_links):
+            if source_id not in resources or target_id not in resources:
+                continue
+            key = (source_id, target_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                {
+                    "Source": source_id,
+                    "Target": target_id,
+                    "Type": "orthogonal",
+                    "SourcePosition": "S",
+                    "TargetPosition": "N",
+                }
+            )
         return links
     
     def _find_internet_gateway(self, vpc_id: str) -> Optional[str]:
@@ -2573,6 +2733,12 @@ class AWSLabsTransformerV2:
         """Convenience method to transform a view and return the diagram data."""
         transformer = cls(view)
         return transformer.transform()
+    def _register_render_node(self, resource_id: Optional[str], node_id: Optional[str] = None) -> None:
+        """Track which diagram node represents a given resource."""
+        if not resource_id:
+            return
+        self._resource_render_map[resource_id] = node_id or resource_id
+
     def _create_cluster_projection(
         self,
         resources: Dict[str, Any],
@@ -2606,8 +2772,6 @@ class AWSLabsTransformerV2:
                 "Title": badge_title,
             }
             children.append(badge_id)
-            if svc_node_id in resources:
-                self._lb_service_links.add((lb_node_id, svc_node_id))
 
         resources[proj_id] = {
             "Type": "AWS::ECS::Cluster",
@@ -2634,10 +2798,6 @@ class AWSLabsTransformerV2:
             self._cluster_lb_owner[cluster_node_id] = lb_id
             clusters_reassigned.add(cluster_node_id)
             self._cluster_lb_consumers.add(cluster_node_id)
-            for svc_id in service_ids:
-                svc_node_id = f"ecs-{svc_id}-in-{cluster_node_id}"
-                if svc_node_id in resources:
-                    self._lb_service_links.add((lb_node_id, svc_node_id))
             display_node_id = (
                 f"cluster-display-{self._sanitize_identifier(cluster_node_id)}-"
                 f"lb-{self._sanitize_identifier(lb_id)}-tg-{self._sanitize_identifier(tg_id)}"
@@ -2652,13 +2812,19 @@ class AWSLabsTransformerV2:
             resources, cluster_node_id, service_ids, lb_node_id, lb_id, tg_id, group_key
         )
     def _collect_direct_targets(
-        self, lb_node_id: str, resources: Dict[str, Any]
+        self, lb_node_id: str, resources: Dict[str, Any], group_key: str
     ) -> List[str]:
         """Build direct sections for targets grouped outside TG nodes."""
+        suffix = f"-in-{group_key}"
         direct_targets = [
             target
             for source, target in self._lb_service_links
             if source == lb_node_id and target in resources
+            and (
+                target.endswith(suffix)
+                or self._cluster_parent.get(target) == group_key
+                or self._group_parent.get(target) == group_key
+            )
         ]
         logger.debug("Collecting direct targets for %s: %s", lb_node_id, direct_targets)
         if not direct_targets:
@@ -2679,11 +2845,21 @@ class AWSLabsTransformerV2:
         sections: List[str],
         resources: Dict[str, Any],
     ) -> Optional[str]:
-        effective_sections = sections or self._collect_direct_targets(lb_node_id, resources)
+        effective_sections = sections or self._collect_direct_targets(lb_node_id, resources, group_key)
         logger.debug("Building stack for %s: sections=%s", lb_id, effective_sections)
         if not effective_sections:
             return None
-        stack_children = [lb_node_id] + effective_sections
+        if len(effective_sections) > 1:
+            row_id = (
+                f"lb-{self._sanitize_identifier(lb_id)}-targets-row-in-{group_key}"
+            )
+            resources[row_id] = {
+                "Type": "AWS::Diagram::HorizontalStack",
+                "Children": effective_sections,
+            }
+            stack_children = [lb_node_id, row_id]
+        else:
+            stack_children = [lb_node_id] + effective_sections
         if len(stack_children) == 1:
             return None
         stack_id = f"lb-{lb_id}-stack-in-{group_key}"
@@ -2693,3 +2869,219 @@ class AWSLabsTransformerV2:
             "Children": stack_children,
         }
         return stack_id
+
+    def _diagram_node_id(self, resource: BaseResource) -> str:
+        """Return the diagram node identifier used for the given resource."""
+        if resource.resource_type == ResourceType.ROUTE53_HOSTED_ZONE:
+            return f"route53-hz-{self._sanitize_identifier(resource.resource_id)}"
+        if resource.resource_type == ResourceType.ROUTE53_RECORD:
+            digest = hashlib.sha1(resource.resource_id.encode("utf-8")).hexdigest()[:12]
+            return f"route53-record-{digest}"
+        return resource.resource_id
+
+    def _find_eni_owner_resource(self, eni_id: str) -> Optional[BaseResource]:
+        """Return the resource that owns the given ENI, if known."""
+        for rel in self.relationships:
+            if rel.source_id != eni_id:
+                continue
+            if rel.relationship_type == RelationshipType.ATTACHED_TO:
+                owner = self.resources.get(rel.target_id)
+                if owner:
+                    return owner
+        for rel in self.relationships:
+            if rel.source_id != eni_id:
+                continue
+            if rel.relationship_type == RelationshipType.MEMBER_OF:
+                owner = self.resources.get(rel.target_id)
+                if owner:
+                    return owner
+        return None
+
+    def _infer_eni_owner_label(self, resource: BaseResource) -> Optional[str]:
+        """Best-effort textual description of the ENI owner."""
+        props = resource.properties or {}
+        description = str(props.get("description") or resource.name or "").strip()
+        attachment = props.get("attachment") or {}
+        if not description and not attachment:
+            return None
+        lower_desc = description.lower()
+        instance_owner = str(attachment.get("InstanceOwnerId") or "").lower()
+
+        if instance_owner in {"amazon-elb", "amazon-elbv2"} or lower_desc.startswith("elb "):
+            lb_name = self._extract_lb_name_from_description(description)
+            return f"Load Balancer {lb_name}" if lb_name else description or None
+
+        if "transit gateway" in lower_desc and "tgw-attach" in lower_desc:
+            return description or "Transit Gateway Attachment"
+
+        if "arn:aws:ecs" in lower_desc and "attachment/" in lower_desc:
+            attachment_id = description.split("attachment/", 1)[-1]
+            return f"ECS attachment {attachment_id}"
+
+        if instance_owner.startswith("amazon-lambda"):
+            return "Lambda managed ENI"
+
+        return description or None
+
+    @staticmethod
+    def _extract_lb_name_from_description(description: str) -> Optional[str]:
+        if not description:
+            return None
+        if " " in description:
+            desc = description.split(" ", 1)[1]
+        else:
+            desc = description
+        parts = desc.split("/")
+        if len(parts) >= 2:
+            return parts[1]
+        return desc
+
+    def _should_include_global_resource(self, node_id: str) -> bool:
+        """Return True if a global resource should be rendered."""
+        if node_id in self._global_service_ids:
+            return node_id in self._linked_global_service_ids
+        return True
+
+    def _build_global_service_links(self) -> None:
+        """Link global services (CloudFront/Global Accelerator) to their backends."""
+        self._linked_global_service_ids = set()
+        if not self._global_service_ids:
+            return
+        for service_id in sorted(self._global_service_ids):
+            service = self.resources.get(service_id)
+            if not service:
+                continue
+            source_node = self._resource_render_map.get(service_id)
+            if not source_node:
+                continue
+            if service.resource_type == ResourceType.GLOBAL_ACCELERATOR:
+                backend_ids = self._find_global_accelerator_backends(service_id)
+            elif service.resource_type == ResourceType.CLOUDFRONT_DISTRIBUTION:
+                backend_ids = self._find_cloudfront_backends(service)
+            else:
+                backend_ids = []
+            for backend_id in backend_ids:
+                if not self._is_resource_in_vpc(backend_id):
+                    continue
+                target_node = self._resource_render_map.get(backend_id)
+                if not target_node or target_node == source_node:
+                    continue
+                self._global_service_links.add((source_node, target_node))
+                self._linked_global_service_ids.add(service_id)
+
+    def _find_global_accelerator_backends(self, accelerator_id: str) -> List[str]:
+        """Return resource IDs targeted by the given Global Accelerator."""
+        backends: List[str] = []
+        seen: Set[str] = set()
+        for relationship in self.relationships:
+            if (
+                relationship.relationship_type != RelationshipType.CONNECTS_TO
+                or relationship.source_id != accelerator_id
+            ):
+                continue
+            target_id = relationship.target_id
+            if target_id in seen:
+                continue
+            if target_id in self.resources:
+                seen.add(target_id)
+                backends.append(target_id)
+        return backends
+
+    def _find_cloudfront_backends(self, distribution: BaseResource) -> List[str]:
+        """Infer CloudFront origins that point to in-VPC load balancers."""
+        origins = (distribution.properties or {}).get("origins") or []
+        if not origins:
+            return []
+        lb_resources = [
+            res
+            for res in self.resources.values()
+            if res.resource_type == ResourceType.LOAD_BALANCER
+        ]
+        matches: List[str] = []
+        seen: Set[str] = set()
+        for origin in origins:
+            origin_type = str(origin.get("type") or origin.get("Type") or "").lower()
+            if origin_type and origin_type not in {"load_balancer", "custom"}:
+                continue
+            domain = origin.get("domain_name") or origin.get("DomainName")
+            if not domain:
+                continue
+            backend_id = self._match_origin_to_load_balancer(str(domain), lb_resources)
+            if backend_id and backend_id not in seen:
+                seen.add(backend_id)
+                matches.append(backend_id)
+        return matches
+
+    def _match_origin_to_load_balancer(
+        self, origin_domain: str, lb_resources: List[BaseResource]
+    ) -> Optional[str]:
+        normalized_domain = origin_domain.lower()
+        for lb in lb_resources:
+            candidates: List[str] = []
+            if lb.name:
+                candidates.append(str(lb.name).lower())
+            dns_name = (lb.properties or {}).get("dns_name") or (lb.properties or {}).get("DNSName")
+            if dns_name:
+                candidates.append(str(dns_name).lower())
+            arn_fragment = self._extract_lb_name_from_arn(lb.resource_id)
+            if arn_fragment:
+                candidates.append(arn_fragment.lower())
+            candidates.append(lb.resource_id.lower())
+            for candidate in candidates:
+                if candidate and (candidate in normalized_domain or normalized_domain in candidate):
+                    return lb.resource_id
+        return None
+
+    @staticmethod
+    def _extract_lb_name_from_arn(lb_arn: str) -> Optional[str]:
+        if not lb_arn or ":loadbalancer/" not in lb_arn:
+            return None
+        try:
+            fragment = lb_arn.split(":loadbalancer/", 1)[1]
+            parts = fragment.split("/")
+            if len(parts) >= 2:
+                return parts[1]
+        except Exception:
+            return None
+        return None
+
+    def _is_resource_in_vpc(self, resource_id: str) -> bool:
+        resource = self.resources.get(resource_id)
+        if not resource:
+            return False
+        props = getattr(resource, "properties", {}) or {}
+        if props.get("vpc_id"):
+            return True
+        region = getattr(getattr(resource, "location", None), "region", "")
+        return bool(region and region.lower() not in {"aws-global", "global"})
+
+    ENI_SUPPORTED_OWNER_TYPES: Set[ResourceType] = {
+        ResourceType.EC2_INSTANCE,
+        ResourceType.ECS_SERVICE,
+        ResourceType.LAMBDA_FUNCTION,
+        ResourceType.LOAD_BALANCER,
+        ResourceType.VPC_ENDPOINT,
+        ResourceType.NAT_GATEWAY,
+        ResourceType.TRANSIT_GATEWAY,
+        ResourceType.CLOUDFRONT_DISTRIBUTION,
+        ResourceType.GLOBAL_ACCELERATOR,
+    }
+
+    def _supports_eni_dedup_for(self, resource: Optional[BaseResource]) -> bool:
+        if not resource:
+            return False
+        return resource.resource_type in self.ENI_SUPPORTED_OWNER_TYPES
+
+    def _is_global_service_eni(self, resource: BaseResource) -> bool:
+        if resource.resource_type != ResourceType.NETWORK_INTERFACE:
+            return False
+        props = resource.properties or {}
+        tags = {str(k).lower(): v for k, v in (resource.metadata.tags or {}).items()}
+        service_name = str(tags.get("awsservicename") or "").lower()
+        description = str(props.get("description") or "").lower()
+        interface_type = str(props.get("interface_type") or "").lower()
+        haystack = " ".join([service_name, description, interface_type])
+        for keyword in ("globalaccelerator", "global accelerator", "cloudfront"):
+            if keyword in haystack:
+                return True
+        return False

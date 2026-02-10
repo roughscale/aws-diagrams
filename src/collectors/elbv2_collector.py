@@ -63,7 +63,9 @@ class ELBV2Collector(BaseCollector):
                         'type': lb_type,
                         'scheme': scheme,
                         'subnet_ids': subnet_ids,
-                        'security_group_ids': sg_ids
+                        'security_group_ids': sg_ids,
+                        'dns_name': lb.get('DNSName'),
+                        'canonical_hosted_zone_id': lb.get('CanonicalHostedZoneId'),
                     }
                 )
                 self.add_resource(res)
@@ -131,4 +133,3 @@ class ELBV2Collector(BaseCollector):
                         self.collected_resources[tg_arn].properties.setdefault('targets', []).append(tgt)
         except Exception as e:
             logger.warning(f"ELBv2 collection partial/failed: {e}")
-

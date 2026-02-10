@@ -1,7 +1,14 @@
 from datetime import datetime, timezone
 
 from transformers import AWSLabsTransformer, AWSLabsTransformerV2
-from topology.schema import BaseResource, ResourceLocation, ResourceMetadata, ResourceType
+from topology.schema import (
+    BaseResource,
+    ResourceLocation,
+    ResourceMetadata,
+    ResourceType,
+    Relationship,
+    RelationshipType,
+)
 
 from .test_awslabs_transformer import (
     _build_view,
@@ -355,6 +362,10 @@ def test_awslabs_transformer_v2_renders_global_services_stack():
 
     now = datetime.now(timezone.utc)
     location = ResourceLocation(account_id="123456789012", region="aws-global")
+    lb_resource = view.filtered_resources["lb-1"]
+    lb_resource.properties["dns_name"] = "demo-alb-123456.us-east-1.elb.amazonaws.com"
+    lb_resource.properties["vpc_id"] = "vpc-1"
+
     cf_resource = BaseResource(
         resource_id="cf-dist-1234",
         resource_type=ResourceType.CLOUDFRONT_DISTRIBUTION,
@@ -362,7 +373,15 @@ def test_awslabs_transformer_v2_renders_global_services_stack():
         arn="arn:aws:cloudfront::123456789012:distribution/cf-dist-1234",
         location=location,
         metadata=ResourceMetadata(discovered_at=now, last_updated=now),
-        properties={},
+        properties={
+            "origins": [
+                {
+                    "id": "alb-origin",
+                    "domain_name": "demo-alb-123456.us-east-1.elb.amazonaws.com",
+                    "type": "load_balancer",
+                }
+            ]
+        },
     )
     ga_resource = BaseResource(
         resource_id="arn:aws:globalaccelerator::123456789012:accelerator/ga-1",
@@ -375,6 +394,13 @@ def test_awslabs_transformer_v2_renders_global_services_stack():
     )
     view.filtered_resources[cf_resource.resource_id] = cf_resource
     view.filtered_resources[ga_resource.resource_id] = ga_resource
+    view.filtered_relationships.append(
+        Relationship(
+            source_id=ga_resource.resource_id,
+            target_id=lb_resource.resource_id,
+            relationship_type=RelationshipType.CONNECTS_TO,
+        )
+    )
 
     diagram = AWSLabsTransformerV2(view).transform()
     resources = diagram["Diagram"]["Resources"]

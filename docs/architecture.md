@@ -97,17 +97,21 @@ This document provides an architectural overview of the AWS Topology Discovery a
 
 ### 5. Transformers (`src/transformers/`)
 
-**Purpose**: Converts topology views to diagram-as-code formats.
+**Purpose**: Convert topology views into a generic graph, then render that graph
+into specific diagram formats. All higher-order logic (deduplication, inferred
+relationships, and graph normalization) lives in the base transformer layer so
+exporters only consume the graph.
 
 **Key Classes**:
-- `AWSLabsTransformer`: Converts to AWS Labs format
-- Future: `D2Transformer`, `PlantUMLTransformer`
+- `BaseTransformer`: Builds a generic `DiagramGraph` from a `TopologyView`
+- `AWSLabsTransformerV2`: Renders AWS Labs output **from the graph only**
+- Future: `D2Transformer`, `PlantUMLTransformer` (graph consumers)
 
 **Features**:
-- Resource type mapping
-- Connection generation
-- Layout hints and grouping
-- Metadata preservation
+- **Graph construction**: node/edge creation from the filtered topology
+- **Deduplication**: suppress or collapse resources at graph level
+- **Relationship inference**: synthesize edges (e.g., LB → service) in the graph
+- **Exporter purity**: formatters render the graph without additional inference
 
 ### 6. CLI Interface (`cli/`)
 
@@ -134,7 +138,8 @@ This document provides an architectural overview of the AWS Topology Discovery a
 1. **Loading**: Read topology from YAML file
 2. **Filtering**: Apply view criteria to select relevant resources
 3. **Grouping**: Organize resources for visualization
-4. **Transformation**: Convert to target diagram format
+4. **Graph Build**: `BaseTransformer` builds a generic `DiagramGraph`
+5. **Transform**: Exporters render the graph into target diagram formats
 5. **Output**: Generate diagram-as-code file
 
 ## Scalability Considerations

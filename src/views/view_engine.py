@@ -360,6 +360,7 @@ class ViewEngine:
                 selected_region_name = res.location.region
 
         vpc_resources: Dict[str, BaseResource] = {}
+        retain_resource_ids: Set[str] = set()
         if selected_vpc_resource:
             vpc_resources[vpc_id] = selected_vpc_resource
 
@@ -391,6 +392,14 @@ class ViewEngine:
                 child = self._get_all_resources().get(relationship.target_id)
                 if child:
                     vpc_resources[child.resource_id] = child
+
+        # Include external resources that reference contained nodes (e.g., ECS services in shared VPCs)
+        for relationship in all_relationships:
+            if relationship.relationship_type == RelationshipType.MEMBER_OF and relationship.source_id in vpc_resources:
+                peer = all_resources.get(relationship.target_id)
+                if peer:
+                    vpc_resources[peer.resource_id] = peer
+                    retain_resource_ids.add(peer.resource_id)
 
         # Include VPC peering connection resources that involve this VPC
         for resource_id, resource in all_resources.items():
@@ -486,9 +495,17 @@ class ViewEngine:
 
         # Apply optional explicit filters for account/region without cross-account expansion
         if account_id:
-            vpc_resources = {rid: res for rid, res in vpc_resources.items() if res.location.account_id == account_id}
+            vpc_resources = {
+                rid: res
+                for rid, res in vpc_resources.items()
+                if res.location.account_id == account_id or rid in retain_resource_ids
+            }
         if region:
-            vpc_resources = {rid: res for rid, res in vpc_resources.items() if res.location.region == region}
+            vpc_resources = {
+                rid: res
+                for rid, res in vpc_resources.items()
+                if res.location.region == region or rid in retain_resource_ids
+            }
         
         # Filter relationships to only include those between VPC resources
         vpc_relationships = []

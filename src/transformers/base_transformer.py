@@ -96,6 +96,18 @@ class BaseTransformer(ABC):
         ResourceType.NETWORK_INTERFACE: "network_interface",
     }
 
+    ENI_SUPPORTED_OWNER_TYPES: Set[ResourceType] = {
+        ResourceType.EC2_INSTANCE,
+        ResourceType.ECS_SERVICE,
+        ResourceType.LAMBDA_FUNCTION,
+        ResourceType.LOAD_BALANCER,
+        ResourceType.VPC_ENDPOINT,
+        ResourceType.NAT_GATEWAY,
+        ResourceType.TRANSIT_GATEWAY,
+        ResourceType.CLOUDFRONT_DISTRIBUTION,
+        ResourceType.GLOBAL_ACCELERATOR,
+    }
+
     def __init__(self, view: TopologyView):
         self.view = view
         self.graph = DiagramGraph()
@@ -146,6 +158,9 @@ class BaseTransformer(ABC):
         # Step 3: Create edges from relationships
         self._create_edges()
 
+        # Step 3.5: Add inferred edges (LB -> service, LB -> LB via TG targets)
+        self._add_lb_target_edges()
+
         # Step 4: Apply layout optimizations
         self._optimize_layout()
 
@@ -158,6 +173,133 @@ class BaseTransformer(ABC):
         logger.info(f"Graph creation complete: {stats}")
 
         return self.graph
+
+    def _add_lb_target_edges(self) -> None:
+        """Add deterministic LB target edges based on TG membership.
+
+        These edges are graph-level inferences used by all exporters.
+        """
+        # Build LB -> TG mapping from CONTAINS relationships
+        lb_to_tgs: Dict[str, List[str]] = {}
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type != RelationshipType.CONTAINS:
+                continue
+            src = self.view.filtered_resources.get(rel.source_id)
+            tgt = self.view.filtered_resources.get(rel.target_id)
+            if not src or not tgt:
+                continue
+            if src.resource_type == ResourceType.LOAD_BALANCER and tgt.resource_type == ResourceType.TARGET_GROUP:
+                lb_to_tgs.setdefault(src.resource_id, []).append(tgt.resource_id)
+
+        # Build TG -> ECS services mapping from service properties
+        tg_to_services: Dict[str, List[str]] = {}
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type != ResourceType.ECS_SERVICE:
+                continue
+            for tg_id in resource.properties.get("target_group_arns") or []:
+                tg_to_services.setdefault(str(tg_id), []).append(resource_id)
+
+        # Emit LB -> service edges (with via_tg metadata) and LB -> LB edges
+        for lb_id, tg_ids in lb_to_tgs.items():
+            for tg_id in tg_ids:
+                # LB -> ECS service
+                for svc_id in tg_to_services.get(tg_id, []):
+                    if lb_id not in self.graph.nodes or svc_id not in self.graph.nodes:
+                        continue
+                    edge_id = f"targets:{lb_id}->{svc_id}:{tg_id}"
+                    if edge_id in self.graph.edges:
+                        continue
+                    self.graph.add_edge(GraphEdge(
+                        id=edge_id,
+                        source_id=lb_id,
+                        target_id=svc_id,
+                        relationship_type=RelationshipType.TARGETS.value,
+                        properties={"via_tg": tg_id},
+                    ))
+
+                # LB -> LB (when TG target explicitly references another LB ARN)
+                tg_res = self.view.filtered_resources.get(tg_id)
+                if not tg_res:
+                    continue
+                for target in tg_res.properties.get("targets") or []:
+                    tid = target.get("id")
+                    if not tid or not str(tid).startswith("arn:aws:elasticloadbalancing:"):
+                        continue
+                    target_lb_id = str(tid)
+                    if lb_id not in self.graph.nodes or target_lb_id not in self.graph.nodes:
+                        continue
+                    edge_id = f"targets:{lb_id}->{target_lb_id}:{tg_id}"
+                    if edge_id in self.graph.edges:
+                        continue
+                    self.graph.add_edge(GraphEdge(
+                        id=edge_id,
+                        source_id=lb_id,
+                        target_id=target_lb_id,
+                        relationship_type=RelationshipType.TARGETS.value,
+                        properties={"via_tg": tg_id},
+                    ))
+
+    def _collect_dedup_eni_ids(self) -> Set[str]:
+        """Collect ENI IDs that should be deduplicated when their owners are rendered."""
+        dedup_eni_ids: Set[str] = set(self._collect_service_eni_ids())
+
+        # Dedup ENIs that have explicit relationships to first-class owners
+        for rel in self.view.filtered_relationships:
+            if rel.relationship_type not in {
+                RelationshipType.ATTACHED_TO,
+                RelationshipType.MEMBER_OF,
+            }:
+                continue
+            eni = self.view.filtered_resources.get(rel.source_id)
+            if not eni or eni.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            owner = self.view.filtered_resources.get(rel.target_id)
+            if owner and owner.resource_type in self.ENI_SUPPORTED_OWNER_TYPES:
+                dedup_eni_ids.add(eni.resource_id)
+
+        # Dedup ENIs that can be inferred to belong to first-class owners
+        for resource_id, resource in self.view.filtered_resources.items():
+            if resource.resource_type != ResourceType.NETWORK_INTERFACE:
+                continue
+            props = resource.properties or {}
+            attachment = props.get("attachment") or {}
+
+            instance_id = (
+                attachment.get("InstanceId")
+                or attachment.get("instance_id")
+                or attachment.get("instanceId")
+            )
+            if instance_id:
+                owner = self.view.filtered_resources.get(str(instance_id))
+                if owner and owner.resource_type == ResourceType.EC2_INSTANCE:
+                    dedup_eni_ids.add(resource_id)
+                    continue
+
+            owner_id = str(attachment.get("InstanceOwnerId") or "").lower()
+            if owner_id in {
+                "amazon-elb",
+                "amazon-elbv2",
+                "amazon-lambda",
+                "amazon-rds",
+                "amazon-elasticache",
+                "amazon-opensearch",
+                "amazon-elasticsearch",
+                "amazon-redshift",
+            }:
+                dedup_eni_ids.add(resource_id)
+                continue
+
+            desc = str(props.get("description") or resource.name or "").lower()
+            if (
+                "arn:aws:ecs" in desc
+                or "ecs attachment" in desc
+                or desc.startswith("elb ")
+                or "elastic load balancer" in desc
+                or "aws lambda vpc eni" in desc
+            ):
+                dedup_eni_ids.add(resource_id)
+
+        return dedup_eni_ids
 
     def _collect_service_eni_ids(self) -> Set[str]:
         """Collect ENI IDs that belong to aggregated services (RDS, ElastiCache, etc.)."""
@@ -274,25 +416,21 @@ class BaseTransformer(ABC):
         """Create nodes for all resources in the view."""
         logger.debug("Creating resource nodes")
 
-        # Collect ENI IDs that belong to aggregated services to avoid cycles
-        service_eni_ids = self._collect_service_eni_ids()
+        # Collect ENI IDs that should be deduplicated to avoid clutter
+        dedup_eni_ids = self._collect_dedup_eni_ids()
 
         for resource_id, resource in self.view.filtered_resources.items():
             if resource_id in self._processed_resources:
                 continue
 
-            # Skip ENIs that belong to aggregated services (following V1 pattern)
-            if (
-                resource.resource_type == ResourceType.NETWORK_INTERFACE
-                and resource_id in service_eni_ids
-            ):
-                logger.debug(
-                    f"Skipping ENI {resource_id} - belongs to aggregated service"
-                )
-                continue
-
             # Create nodes for resources that should be displayed
             node = self._create_node_from_resource(resource)
+            if (
+                resource.resource_type == ResourceType.NETWORK_INTERFACE
+                and resource_id in dedup_eni_ids
+            ):
+                node.properties["render"] = False
+                node.properties["dedup_reason"] = "owner_rendered"
             self.graph.add_node(node)
             self._processed_resources.add(resource_id)
 
@@ -301,11 +439,18 @@ class BaseTransformer(ABC):
         node_id = resource.resource_id
         generic_type = self.RESOURCE_TYPE_MAPPING.get(resource.resource_type, "unknown")
 
+        label = resource.name or node_id
+        if resource.resource_type == ResourceType.NETWORK_INTERFACE:
+            ip = (resource.properties or {}).get("private_ip")
+            label = node_id
+            if ip:
+                label = f"{label}\n{ip}"
+
         # Create base node
         node = GraphNode(
             id=node_id,
             node_type=NodeType.RESOURCE,
-            label=resource.name or node_id,
+            label=label,
             properties={
                 "arn": resource.arn,
                 "account_id": resource.location.account_id,

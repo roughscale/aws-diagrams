@@ -17,6 +17,7 @@ from .opensearch_collector import OpenSearchCollector
 from .redshift_collector import RedshiftCollector
 from .cloudfront_collector import CloudFrontCollector
 from .global_accelerator_collector import GlobalAcceleratorCollector
+from .route53_collector import Route53Collector
 
 __all__ = [
     'BaseCollector',
@@ -33,4 +34,5 @@ __all__ = [
     'RedshiftCollector',
     'CloudFrontCollector',
     'GlobalAcceleratorCollector',
+    'Route53Collector',
 ]

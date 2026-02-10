@@ -38,6 +38,8 @@ class ResourceType(Enum):
     NETWORK_INTERFACE = "network_interface"
     CLOUDFRONT_DISTRIBUTION = "cloudfront_distribution"
     GLOBAL_ACCELERATOR = "global_accelerator"
+    ROUTE53_HOSTED_ZONE = "route53_hosted_zone"
+    ROUTE53_RECORD = "route53_record"
 
 
 class RelationshipType(Enum):

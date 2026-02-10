@@ -177,13 +177,13 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
         except Exception:
             GlobalAcceleratorCollector = None  # type: ignore
         try:
-            from ..collectors.cloudfront_collector import CloudFrontCollector  # type:ignore
+            from ..collectors.route53_collector import Route53Collector  # type: ignore
         except Exception:
-            CloudFrontCollector = None  # type: ignore
+            Route53Collector = None  # type: ignore
         try:
-            from ..collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
-        except Exception:
-            GlobalAcceleratorCollector = None  # type: ignore
+            from ..utils.route53_associations import associate_route53_records
+        except ImportError:
+            from utils.route53_associations import associate_route53_records
         from ..auth import MultiAccountAuthenticator
         from ..topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         try:
@@ -230,13 +230,14 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
         except Exception:
             GlobalAcceleratorCollector = None  # type: ignore
         try:
-            from collectors.cloudfront_collector import CloudFrontCollector  # type: ignore
+            from collectors.route53_collector import Route53Collector  # type: ignore
         except Exception:
-            CloudFrontCollector = None  # type: ignore
+            Route53Collector = None  # type: ignore
         try:
-            from collectors.global_accelerator_collector import GlobalAcceleratorCollector  # type: ignore
-        except Exception:
-            GlobalAcceleratorCollector = None  # type: ignore
+            from utils.route53_associations import associate_route53_records
+        except ImportError:
+            def associate_route53_records(topology):  # type: ignore
+                return 0
         from auth import MultiAccountAuthenticator
         from topology.schema import AWSTopology, TopologyMetadata, OrganizationData
         from topology.serializer import TopologyYAMLSerializer
@@ -343,6 +344,8 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
             global_collector_classes['cloudfront'] = CloudFrontCollector  # type: ignore
         if 'GlobalAcceleratorCollector' in locals() and GlobalAcceleratorCollector:
             global_collector_classes['globalaccelerator'] = GlobalAcceleratorCollector  # type: ignore
+        if 'Route53Collector' in locals() and Route53Collector:
+            global_collector_classes['route53'] = Route53Collector  # type: ignore
 
         if collectors:
             collectors_lower = [c.lower() for c in collectors]
@@ -470,6 +473,16 @@ def collect_account(ctx, account_id: str, regions: tuple, role_name: str,
                 logger.warning(
                     f"Collector {collector_name} failed: {results.get('failure_reason')}"
                 )
+
+        # Link Route 53 records with discovered resources if present
+        try:
+            linked_count = associate_route53_records(topology)
+            if linked_count:
+                logger.info(
+                    f"Linked {linked_count} Route 53 records to discovered resources"
+                )
+        except Exception as exc:
+            logger.warning(f"Route 53 association step failed: {exc}")
         
         # Update topology metadata
         topology.metadata.total_resources = total_resources

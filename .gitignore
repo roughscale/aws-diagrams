@@ -73,18 +73,27 @@ logs/
 *.key
 
 # Topology data (may contain sensitive information)
+topology.yaml
+topology.yml
 topology-*.yaml
 topology-*.yml
 collected-topology.yaml
 collected-topology.yml
+topology_*.yaml
+topology_*.yml
 
 # Generated diagrams
 diagrams/
 output/
+outputs/
 *.png
 *.jpg
 *.svg
 *.pdf
+*.drawio
+*.d2
+*.puml
+*.plantuml
 
 # Cache
 .cache/
